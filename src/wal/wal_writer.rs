@@ -1,9 +1,9 @@
 use std::fmt::Debug;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
 use std::thread::{sleep, spawn};
 use std::time::Duration;
 
+use crate::common::ResultPoller;
 use crate::storage::blob_store::WriteCursor;
 use crate::wal::wal_entry::{Checksum, WalEntry, WalEntryBlock, WalError};
 
@@ -147,45 +147,14 @@ impl<WC: WriteCursor> WalWriteHandler<WC> {
     }
 }
 
-#[derive(Debug)]
-enum MultiWalWriter<WC: WriteCursor> {
-    MultiThreaded {
-        request_tx: Sender<WalRequestWrapper>,
-        // TODO(t/1374): Allow users to configure the DB to only flush
-        // when told to do so.
-        #[allow(dead_code)]
-        wait_for_flush: bool,
-    },
-    SingleThreaded {
-        // This is needed in case WC is not clonable.
-        handler: Arc<Mutex<Option<WalWriteHandler<WC>>>>,
-    },
+#[derive(Debug, Clone)]
+struct MultiWalWriter {
+    request_tx: Sender<WalRequestWrapper>,
 }
 
-impl<WC: WriteCursor> Clone for MultiWalWriter<WC> {
-    fn clone(&self) -> Self {
-        match self {
-            MultiWalWriter::MultiThreaded {
-                request_tx,
-                wait_for_flush,
-            } => MultiWalWriter::MultiThreaded {
-                request_tx: request_tx.clone(),
-                wait_for_flush: *wait_for_flush,
-            },
-            MultiWalWriter::SingleThreaded { handler } => MultiWalWriter::SingleThreaded {
-                handler: handler.clone(),
-            },
-        }
-    }
-}
-
-impl<WC: WriteCursor> MultiWalWriter<WC>
-where
-    WC: Send + 'static,
-{
-    fn new(
+impl MultiWalWriter {
+    fn new<WC: WriteCursor + Send + 'static>(
         blob_writer: WC,
-        max_concurrent_writes: Option<usize>,
         return_ok_before_flush: bool,
         max_flush_wait_millis: Option<u64>,
         max_wal_size_bytes: usize,
@@ -206,85 +175,51 @@ where
         let handler =
             WalWriteHandler::new(blob_writer, request_rx, max_wal_size_bytes, flush_action);
 
-        if let Some(max_concurrent_writes) = max_concurrent_writes {
-            if max_concurrent_writes == 1 {
-                let handler = Arc::new(Mutex::new(Some(handler)));
-                return MultiWalWriter::SingleThreaded { handler };
-            }
-        }
-
         // TODO(t/1395): This should be handled by a fiber scheduler.
         if let Some(max_flush_wait_millis) = max_flush_wait_millis {
             let request_tx_2 = request_tx.clone();
             spawn(move || {
-                MultiWalWriter::<WC>::handle_maintenance_requests(
-                    max_flush_wait_millis,
-                    request_tx_2,
-                );
+                MultiWalWriter::handle_maintenance_requests(max_flush_wait_millis, request_tx_2);
             });
         }
 
         spawn(move || {
             handler.run();
         });
-        // TODO(t/1374): `wait_for_flush` should be configurable.
-        let wait_for_flush = true;
-        MultiWalWriter::MultiThreaded {
-            request_tx,
-            wait_for_flush,
-        }
+        MultiWalWriter { request_tx }
     }
 
     fn write(&self, entry: WalEntry) -> Result<(), WalError> {
-        match self {
-            MultiWalWriter::MultiThreaded { request_tx, .. } => {
-                let (result_tx, result_rx) = channel();
-                request_tx
-                    .send(WalRequestWrapper {
-                        request: WalRequest::Write(entry),
-                        result_tx,
-                    })
-                    .unwrap();
-                result_rx.recv().unwrap()
-            }
-            MultiWalWriter::SingleThreaded { handler } => {
-                let mut handler = handler.lock().unwrap();
-                if let Some(handler) = handler.as_mut() {
-                    let (result_tx, result_rx) = channel();
-                    // TODO(t/1395): It should be possible to do this without a
-                    // channel through a send-and-flush function.
-                    handler.append_entry(entry, Some(result_tx));
-                    handler.flush()?;
-                    let result = result_rx.recv().unwrap();
-                    result?;
-                    return Ok(());
-                }
-                Err(WalError::Closed)
-            }
-        }
+        let (result_tx, result_rx) = channel();
+        self.request_tx
+            .send(WalRequestWrapper {
+                request: WalRequest::Write(entry),
+                result_tx,
+            })
+            .unwrap();
+        result_rx.recv().unwrap()
+    }
+
+    async fn async_write(&self, entry: WalEntry) -> Result<(), WalError> {
+        let (result_tx, result_rx) = channel();
+        self.request_tx
+            .send(WalRequestWrapper {
+                request: WalRequest::Write(entry),
+                result_tx,
+            })
+            .unwrap();
+        ResultPoller::new(result_rx).await
     }
 
     fn close(self) -> Result<(), WalError> {
-        match self {
-            MultiWalWriter::MultiThreaded { request_tx, .. } => {
-                let (result_tx, result_rx) = channel();
-                request_tx
-                    .send(WalRequestWrapper {
-                        request: WalRequest::Close,
-                        result_tx,
-                    })
-                    .unwrap();
-                result_rx.recv().unwrap()
-            }
-            MultiWalWriter::SingleThreaded { handler } => {
-                let mut handler = handler.lock().unwrap();
-                if let Some(inner) = handler.take() {
-                    inner.close()?;
-                    return Ok(());
-                }
-                Err(WalError::Closed)
-            }
-        }
+        let (result_tx, result_rx) = channel();
+        self.request_tx
+            .send(WalRequestWrapper {
+                request: WalRequest::Close,
+                result_tx,
+            })
+            .unwrap();
+        result_rx.recv().unwrap()
     }
 
     fn handle_maintenance_requests(
@@ -307,14 +242,14 @@ where
 }
 
 // TODO(t/1348): Add WAL rotation to WalWriter.
-pub(crate) struct WalWriter<WC: WriteCursor> {
+pub(crate) struct WalWriter {
     // TODO(t/1374): Support limiting concurrent writes.
     #[allow(dead_code)]
     max_concurrent_writes: Option<usize>,
-    multi_threaded_writer: MultiWalWriter<WC>,
+    multi_threaded_writer: MultiWalWriter,
 }
 
-impl<WC: WriteCursor> Clone for WalWriter<WC> {
+impl Clone for WalWriter {
     fn clone(&self) -> Self {
         WalWriter {
             max_concurrent_writes: self.max_concurrent_writes,
@@ -323,7 +258,7 @@ impl<WC: WriteCursor> Clone for WalWriter<WC> {
     }
 }
 
-impl<WC: WriteCursor> Debug for WalWriter<WC> {
+impl Debug for WalWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WalWriter")
             .field("max_concurrent_writes", &self.max_concurrent_writes)
@@ -331,8 +266,8 @@ impl<WC: WriteCursor> Debug for WalWriter<WC> {
     }
 }
 
-impl<WC: WriteCursor + Send + 'static> WalWriter<WC> {
-    pub(crate) fn new(
+impl WalWriter {
+    pub(crate) fn new<WC: WriteCursor + Send + 'static>(
         blob_writer: WC,
         max_concurrent_writes: Option<usize>,
         max_wal_size_bytes: usize,
@@ -343,7 +278,6 @@ impl<WC: WriteCursor + Send + 'static> WalWriter<WC> {
             max_concurrent_writes,
             multi_threaded_writer: MultiWalWriter::new(
                 blob_writer,
-                max_concurrent_writes,
                 return_ok_before_flush,
                 max_flush_wait_millis,
                 max_wal_size_bytes,
@@ -353,6 +287,10 @@ impl<WC: WriteCursor + Send + 'static> WalWriter<WC> {
 
     pub(crate) fn write(&self, entry: WalEntry) -> Result<(), WalError> {
         self.multi_threaded_writer.write(entry)
+    }
+
+    pub(crate) async fn async_write(&self, entry: WalEntry) -> Result<(), WalError> {
+        self.multi_threaded_writer.async_write(entry).await
     }
 
     pub(crate) fn close(self) -> Result<(), WalError> {

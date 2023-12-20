@@ -1,35 +1,45 @@
+use std::async_iter::AsyncIterator;
+use std::fmt::Debug;
+use std::pin::Pin;
 use std::sync::mpsc::{channel, Sender};
+use std::task::{Context as TaskContext, Poll};
 use std::thread::spawn;
 
-use crate::compactor::{Compactor, CompactorError, CompactorMessage};
-use crate::kv::{TombstonePointReader, TombstoneStore, TombstoneValue};
-use crate::logging::{DefaultLogger, Logger};
+use crate::compactor::{Compactor, CompactorError, CompactorMessage, CompactorSettings};
+use crate::context::Context;
+use crate::kv::{
+    AsyncTombstoneIterator, JoinedIter, RangeSet, TombstoneIterator, TombstonePair,
+    TombstonePointReader, TombstoneScanner, TombstoneStore, TombstoneValue,
+    TryAsyncTombstoneScanner, TryTombstoneScanner,
+};
+use crate::logging::Logger;
 use crate::mem_table::MemTable;
-use crate::sst::block_cache::{BlockCache, StorageWrapper};
+use crate::os::{LinuxInterface, OsInterface};
+use crate::sst::block_cache::BlockCache;
 use crate::storage::blob_store::BlobStore;
-use crate::tablet::TabletSstStore;
+use crate::tablet::{SmartTablet, SmartTabletIterator, TabletSstStore};
 use crate::wal::wal_wrapper::WalWrapperConfig;
 
 /// The in memory representation of a AnvilDB database.
 #[derive(Debug, Clone)]
-pub(crate) struct AnvilDb<BC: StorageWrapper, T: TabletSstStore, L: Logger> {
+pub(crate) struct AnvilDb<Ctx: Context> {
+    /// Stores library-wide configuration and backend clients.
+    ctx: Ctx,
     /// The in-memory part of the LSM tree
     /// The mem_table implementation
     /// is already thread safe, so we do not want to hold
     /// a this lock while manipulating it.
-    mem_table: MemTable<BC::B, L>,
+    mem_table: MemTable<Ctx>,
     /// the on-disk part of the LSM tree
-    sst_store: T,
+    sst_store: SmartTablet,
     /// the compactor object
     compactor_tx: Sender<CompactorMessage>,
 }
 
-impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> AnvilDb<BC, T, DefaultLogger>
+impl<Ctx: Context> AnvilDb<Ctx>
 where
-    BC: Send + 'static,
-    T: Send + 'static,
-    <<BC as StorageWrapper>::B as BlobStore>::WC: Send + Sync + 'static,
-    String: From<<T as TombstonePointReader>::E>,
+    Ctx: 'static,
+    <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
 {
     /// Create a new database instance.
     ///
@@ -40,53 +50,43 @@ where
     /// # Returns
     ///
     /// A new database instance, or an error String on error.
-    pub(crate) fn new(store: BC::B) -> Result<AnvilDb<BC, T, DefaultLogger>, String> {
-        let config = AnvilDbConfig::default();
-        Self::with_config(store, config)
-    }
-}
-
-impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>, L: Logger> AnvilDb<BC, T, L>
-where
-    BC: Send + 'static,
-    T: Send + 'static,
-    <<BC as StorageWrapper>::B as BlobStore>::WC: Send + Sync + 'static,
-    String: From<<T as TombstonePointReader>::E>,
-{
-    pub(crate) fn with_config<L1: Logger>(
-        store: BC::B,
-        config: AnvilDbConfig<L1>,
-    ) -> Result<AnvilDb<BC, T, L1>, String>
+    pub(crate) fn new(blob_store: <Ctx as Context>::BlobStore) -> Result<AnvilDb<Ctx>, String>
     where
-        <<BC as StorageWrapper>::B as BlobStore>::WC: Send + Sync + 'static,
+        <Ctx as Context>::Logger: Default,
     {
-        let block_cache = <BC as StorageWrapper>::C::with_capacity(config.block_cache_bytes);
-        let storage_wrapper = BC::from((store.clone(), block_cache));
+        let config = AnvilDbConfig::default();
+        Self::with_config(blob_store, config)
+    }
+
+    pub(crate) fn with_config(
+        blob_store: <Ctx as Context>::BlobStore,
+        config: AnvilDbConfig<<Ctx as Context>::Logger>,
+    ) -> Result<AnvilDb<Ctx>, String> {
+        let max_cached_blocks = config.block_cache_bytes / config.target_block_size;
+        let block_cache = <Ctx as Context>::BlockCache::with_capacity(max_cached_blocks);
+        let ctx = Ctx::from((blob_store.clone(), block_cache, config.logger.clone()));
 
         let (compactor_tx, compactor_rx) = channel::<CompactorMessage>();
-        let mem_table = MemTable::new(
-            store,
-            compactor_tx.clone(),
-            config.wal_config,
-            config.logger,
-        )?;
+        let mem_table = MemTable::new(ctx.clone(), compactor_tx.clone(), config.wal_config())?;
 
         let levels: Vec<String> = Vec::new();
-        let sst_store = T::recover(
-            storage_wrapper.clone(),
+        let sst_store = SmartTablet::recover(
+            ctx.blob_store_ref(),
             levels.into_iter(),
             compactor_tx.clone(),
         )?;
 
         let compactor = Compactor::new(
-            storage_wrapper,
+            ctx.clone(),
             sst_store.clone(),
+            config.compactor_settings(),
             compactor_tx.clone(),
             compactor_rx,
         );
         spawn(move || compactor.run());
 
         Ok(AnvilDb {
+            ctx,
             mem_table,
             sst_store,
             compactor_tx,
@@ -94,30 +94,47 @@ where
     }
 
     /// Get an element from the database.
+    ///
     /// # Arguments
+    ///
     /// - key: the key to retrieve
+    ///
     /// # Returns
+    ///
     /// A Cord if found, or an error string.
     pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
-        let found = self.mem_table.get(key)?;
+        let found = self.mem_table.get(&self.ctx, key)?;
         if let Some(value) = found {
             return Ok(value.into());
         }
-        let found = self.sst_store.get(key)?;
+        let found = self.sst_store.get(&self.ctx, key)?;
         if let Some(value) = found {
             return Ok(value.into());
         }
         Ok(None)
     }
 
+    pub(crate) async fn async_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        self.get(key)
+    }
+
     /// Set a key-value pair for the database.
+    ///
     /// # Arguments
+    ///
     /// - key: the key to set
     /// - value: the value to set
+    ///
     /// # Returns
+    ///
     /// An error String on error.
     pub(crate) fn set(&self, key: &[u8], value: &[u8]) -> Result<(), String> {
         self.mem_table.set(key, &value)?;
+        Ok(())
+    }
+
+    pub(crate) async fn async_set(&self, key: &[u8], value: &[u8]) -> Result<(), String> {
+        self.mem_table.async_set(key, &value).await?;
         Ok(())
     }
 
@@ -133,6 +150,18 @@ where
     pub(crate) fn remove(&self, key: &[u8]) -> Result<(), String> {
         self.mem_table.set(key, &TombstoneValue::Tombstone)?;
         Ok(())
+    }
+
+    pub(crate) async fn async_remove(&self, key: &[u8]) -> Result<(), String> {
+        self.remove(key)
+    }
+
+    pub(crate) fn try_scan(&self) -> Result<AnvilDbScanner<Ctx>, String> {
+        let a = TombstoneScanner::scan(&self.mem_table);
+        let b = self.sst_store.try_scan(&self.ctx)?;
+        Ok(AnvilDbScanner {
+            inner: JoinedIter::new(a, b),
+        })
     }
 
     pub(crate) fn compact(&self) -> Result<(), String> {
@@ -156,18 +185,18 @@ where
     ///
     /// A new database instance, or an error String on error.
     pub(crate) fn recover(
-        storage: BC::B,
-        config: AnvilDbConfig<L>,
-    ) -> Result<AnvilDb<BC, T, L>, String> {
-        // TODO(t/1387): Cache size should be configurable when it is
-        // implemented.
-        let storage_wrapper = BC::from((storage, BC::C::with_capacity(0)));
+        blob_store: <Ctx as Context>::BlobStore,
+        config: AnvilDbConfig<<Ctx as Context>::Logger>,
+    ) -> Result<AnvilDb<Ctx>, String> {
+        let block_cache = <Ctx as Context>::BlockCache::with_capacity(config.block_cache_bytes);
+        let ctx = Ctx::from((blob_store.clone(), block_cache, config.logger.clone()));
 
         let (mem_table, sst_store, compactor, compactor_tx) =
-            MemTable::recover(storage_wrapper.clone(), config.wal_config, config.logger)?;
+            MemTable::recover(ctx.clone(), config)?;
         spawn(move || compactor.run());
 
         Ok(AnvilDb {
+            ctx,
             mem_table,
             sst_store,
             compactor_tx,
@@ -179,10 +208,7 @@ where
     /// # Returns
     ///
     /// An error String on error.
-    pub(crate) fn close(self) -> Result<(), String>
-    where
-        <<BC as StorageWrapper>::B as BlobStore>::WC: Send + Sync + 'static,
-    {
+    pub(crate) fn close(self) -> Result<(), String> {
         self.compactor_tx
             .send(CompactorMessage::Shutdown)
             .map_err(|err| format!("failed to send shutdown message: {:?}", err))?;
@@ -191,100 +217,190 @@ where
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct AnvilDbScanner {}
+type BigScanType<Ctx> =
+    JoinedIter<String, <MemTable<Ctx> as TombstoneScanner>::Iter, SmartTabletIterator<Ctx>>;
 
-impl AnvilDbScanner {
-    pub(crate) fn from(self, _key: &[u8]) -> Result<Self, String> {
-        // TODO(t/1373): Implement scans.
-        todo!()
+#[derive(Debug)]
+pub(crate) struct AnvilDbScanner<Ctx: Context>
+where
+    <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
+{
+    inner: BigScanType<Ctx>,
+}
+
+impl<Ctx: Context> Iterator for AnvilDbScanner<Ctx>
+where
+    <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
+{
+    type Item = Result<TombstonePair, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+impl<Ctx: Context> RangeSet for AnvilDbScanner<Ctx>
+where
+    <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync,
+{
+    fn from(mut self, key: &[u8]) -> Self {
+        self.inner = self.inner.from(key);
+        self
     }
 
-    pub(crate) fn to(self, _key: &[u8]) -> Result<Self, String> {
-        // TODO(t/1373): Implement scans.
-        todo!()
+    fn to(mut self, key: &[u8]) -> Self {
+        self.inner = self.inner.to(key);
+        self
+    }
+}
+
+impl<Ctx: Context> TombstoneIterator for AnvilDbScanner<Ctx>
+where
+    <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync,
+{
+    type Error = String;
+}
+
+#[derive(Debug)]
+pub(crate) struct AsyncAnvilDbScanner<Ctx: Context>
+where
+    <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync,
+{
+    inner: BigScanType<Ctx>,
+}
+
+impl<Ctx: Context> AsyncIterator for AsyncAnvilDbScanner<Ctx>
+where
+    <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync,
+{
+    type Item = Result<TombstonePair, String>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        // TODO(t/1336): This should actually poll the inner iterator.
+        Poll::Ready(Some(Err("not implemented".to_string())))
+    }
+}
+
+impl<Ctx: Context> RangeSet for AsyncAnvilDbScanner<Ctx>
+where
+    <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync,
+{
+    fn from(mut self, key: &[u8]) -> Self {
+        self.inner = self.inner.from(key);
+        self
+    }
+
+    fn to(mut self, key: &[u8]) -> Self {
+        self.inner = self.inner.to(key);
+        self
+    }
+}
+
+impl<Ctx: Context> AsyncTombstoneIterator for AsyncAnvilDbScanner<Ctx>
+where
+    <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync,
+{
+    type Error = String;
+}
+
+impl<Ctx: Context> TryAsyncTombstoneScanner for AnvilDb<Ctx>
+where
+    <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync,
+{
+    type Error = String;
+    type Iter = AsyncAnvilDbScanner<Ctx>;
+
+    fn try_async_scan(&self) -> Result<Self::Iter, Self::Error> {
+        let a = TombstoneScanner::scan(&self.mem_table);
+        let b = self.sst_store.try_scan(&self.ctx)?;
+        Ok(AsyncAnvilDbScanner {
+            inner: JoinedIter::new(a, b),
+        })
     }
 }
 
 pub(crate) struct AnvilDbConfig<L> {
     block_cache_bytes: usize,
+    target_block_size: usize,
     wal_config: WalWrapperConfig,
     logger: L,
 }
 
-impl Default for AnvilDbConfig<DefaultLogger> {
+impl<L: Logger + Default> Default for AnvilDbConfig<L> {
     fn default() -> Self {
-        // TODO(t/1387): The default memory size should be based on how
-        // much memory the system has to spare.
-        let half_gb = 1024 * 1024 * 1024 / 2;
+        // TODO(t/1442): Add support for other OSes.
+        let os_client = LinuxInterface;
+        let block_cache_bytes = if let Ok(b) = os_client.free_ram() {
+            b / 2
+        } else {
+            // 0.5 GiB
+            1024 * 1024 * 1024 / 2
+        };
+
+        // TODO(gs): How to set a reasonable block size?
+        let target_block_size = 32 * 1024 * 1024; // 32 MiB
+
         Self {
-            block_cache_bytes: half_gb,
+            block_cache_bytes,
+            target_block_size,
             wal_config: WalWrapperConfig::default(),
-            logger: DefaultLogger::default(),
+            logger: L::default(),
         }
     }
 }
 
 impl<L: Logger> AnvilDbConfig<L> {
-    pub(crate) fn with_max_concurrent_writers(self, max_concurrent_writers: usize) -> Self {
-        let wal_config = self
-            .wal_config
-            .with_max_concurrent_writers(max_concurrent_writers);
-        let block_cache_bytes = self.block_cache_bytes;
-        let logger = self.logger;
-        AnvilDbConfig {
-            block_cache_bytes,
-            wal_config,
-            logger,
-        }
+    pub(crate) fn wal_config(&self) -> WalWrapperConfig {
+        self.wal_config.clone()
     }
 
-    pub(crate) fn with_max_wal_bytes(self, max_wal_bytes: usize) -> Self {
-        let wal_config = self.wal_config.with_max_wal_bytes(max_wal_bytes);
-        let block_cache_bytes = self.block_cache_bytes;
-        let logger = self.logger;
-        AnvilDbConfig {
-            block_cache_bytes,
-            wal_config,
-            logger,
-        }
+    pub(crate) fn compactor_settings(&self) -> CompactorSettings {
+        CompactorSettings::default().with_target_block_size(self.target_block_size)
+    }
+
+    pub(crate) fn with_max_concurrent_writers(mut self, max_concurrent_writers: usize) -> Self {
+        self.wal_config = self
+            .wal_config
+            .with_max_concurrent_writers(max_concurrent_writers);
+        self
+    }
+
+    pub(crate) fn with_max_wal_bytes(mut self, max_wal_bytes: usize) -> Self {
+        self.wal_config = self.wal_config.with_max_wal_bytes(max_wal_bytes);
+        self
+    }
+
+    pub(crate) fn with_cache_size_bytes(mut self, cache_size_bytes: usize) -> Self {
+        self.block_cache_bytes = cache_size_bytes;
+        self
     }
 }
 
 #[cfg(test)]
 mod test {
     use std::cmp::Ordering;
+    use std::future::Future;
+    use std::task::Waker;
     use std::thread::sleep;
     use std::time::Duration;
     use std::time::Instant;
 
     use super::*;
+    use crate::context::SimpleContext;
+    use crate::helpful_macros::unwrap;
     use crate::logging::debug;
-    use crate::sst::block_cache::NoBlockCache;
-    use crate::sst::block_cache::SimpleStorageWrapper;
+    use crate::logging::DefaultLogger;
+    use crate::sst::block_cache::cache::LruBlockCache;
     use crate::storage::blob_store::InMemoryBlobStore;
-    use crate::tablet::SmartTablet;
     use crate::var_int::VarInt64;
 
+    type TestOnlyContext = SimpleContext<InMemoryBlobStore, LruBlockCache, DefaultLogger>;
     #[test]
     fn test_anvil_db_end_to_end() {
         let store = InMemoryBlobStore::new();
+        let jdb: AnvilDb<TestOnlyContext> = unwrap!(AnvilDb::<_>::new(store));
+        let top: u64 = 10000;
 
-        // TODO(t/1387): This should use the real block cache when it is
-        // implemented.
-        type TestOnlyStorageWrapper = SimpleStorageWrapper<InMemoryBlobStore, NoBlockCache>;
-        let jdb: AnvilDb<
-            TestOnlyStorageWrapper,
-            SmartTablet<TestOnlyStorageWrapper>,
-            DefaultLogger,
-        > = AnvilDb::<
-            TestOnlyStorageWrapper,
-            SmartTablet<TestOnlyStorageWrapper>,
-            DefaultLogger,
-        >::new(store)
-        .unwrap();
-        // This test is too slow when top is too big.
-        let top: u64 = 100;
         for k in 0..top {
             if k % 2 == 0 {
                 let key = VarInt64::try_from(k).unwrap();
@@ -345,6 +461,83 @@ mod test {
         assert!(jdb.close().is_ok());
     }
 
+    #[test]
+    fn test_anvil_db_async_end_to_end() {
+        type TestOnlyContext = SimpleContext<InMemoryBlobStore, LruBlockCache, DefaultLogger>;
+        type TestAnvilDb = AnvilDb<TestOnlyContext>;
+
+        let top: u64 = 10000;
+        let pairs: Vec<_> = (0..top)
+            .map(|k| {
+                let key = VarInt64::try_from(k).unwrap();
+                let val = VarInt64::try_from(k * k).unwrap();
+                (key.data_ref().to_vec(), val.data_ref().to_vec())
+            })
+            .collect();
+
+        let store = InMemoryBlobStore::new();
+        let jdb: TestAnvilDb = AnvilDb::new(store).unwrap();
+        let start = Instant::now();
+        for pair in pairs.iter() {
+            jdb.set(pair.0.as_slice(), pair.1.as_slice()).unwrap();
+        }
+        let duration = start.elapsed();
+        debug!(
+            "Writing {} points synchronously took {:.2} sec ({:.2} us per point)",
+            top,
+            duration.as_secs_f64(),
+            duration.as_micros() as f64 / top as f64
+        );
+        for pair in pairs.iter() {
+            assert_eq!(
+                jdb.get(pair.0.as_slice()).unwrap().unwrap(),
+                pair.1.as_slice()
+            );
+        }
+        assert!(jdb.close().is_ok());
+
+        let store = InMemoryBlobStore::new();
+        let jdb: TestAnvilDb = AnvilDb::new(store).unwrap();
+        let start = Instant::now();
+        let mut futures: Vec<_> = pairs
+            .clone()
+            .into_iter()
+            .map(|pair| {
+                let j2 = jdb.clone();
+                let k = pair.0.clone();
+                let v = pair.1.clone();
+                Box::pin(async move { j2.async_set(k.as_slice(), v.as_slice()).await })
+            })
+            .collect();
+        loop {
+            let mut new_futures = Vec::new();
+            for future in futures.into_iter() {
+                let mut future = future;
+                let waker = Waker::noop();
+                let mut cx = TaskContext::from_waker(&waker);
+                let poll = Pin::new(&mut future).poll(&mut cx);
+                match poll {
+                    Poll::Ready(Err(e)) => panic!("async_set failed: {:?}", e),
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Pending => new_futures.push(future),
+                }
+            }
+            if new_futures.is_empty() {
+                break;
+            }
+            futures = new_futures;
+        }
+
+        let duration = start.elapsed();
+        debug!(
+            "Writing {} points asynchronously took {:.2} sec ({:.2} us per point)",
+            top,
+            duration.as_secs_f64(),
+            duration.as_micros() as f64 / top as f64
+        );
+        assert!(jdb.close().is_ok());
+    }
+
     fn next_rng(state: &mut u64) -> u64 {
         let mut x = *state;
         if x == 0_u64 {
@@ -357,14 +550,10 @@ mod test {
         x
     }
 
-    // TODO(t/1387): This should use the real block cache when it is
-    // implemented.
-    type TestOnlyStorageWrapper = SimpleStorageWrapper<InMemoryBlobStore, NoBlockCache>;
-    type TestOnlyAnvilDb =
-        AnvilDb<TestOnlyStorageWrapper, SmartTablet<TestOnlyStorageWrapper>, DefaultLogger>;
+    type TestOnlyAnvilDb = AnvilDb<TestOnlyContext>;
     fn db_with_max_wal_bytes(max_wal_bytes: usize) -> (InMemoryBlobStore, TestOnlyAnvilDb) {
         let store = InMemoryBlobStore::new();
-        let db: TestOnlyAnvilDb = AnvilDb::<_, _, DefaultLogger>::with_config(
+        let db: TestOnlyAnvilDb = AnvilDb::<_>::with_config(
             store.clone(),
             AnvilDbConfig::default()
                 .with_max_concurrent_writers(1)

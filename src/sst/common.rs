@@ -1,15 +1,29 @@
 use std::cmp::Ordering;
 
 use crate::common::{cmp_key, CastError};
-use crate::storage::blob_store::FileError;
+use crate::sst::block_cache::common::CacheError;
+use crate::storage::blob_store::BlobStoreError;
+
+#[derive(Debug)]
+pub(crate) enum SstReadError {
+    Cache(CacheError),
+    BlobStore((String, BlobStoreError)),
+    PossibleCorruption(String),
+}
 
 #[derive(Debug)]
 pub(crate) enum SstError {
     Parse(String),
     Write(String),
-    Read(String),
+    Read(SstReadError),
     Internal(String),
     EmptySst(String),
+}
+
+impl From<SstReadError> for SstError {
+    fn from(err: SstReadError) -> Self {
+        SstError::Read(err)
+    }
 }
 
 impl From<CastError> for SstError {
@@ -18,9 +32,15 @@ impl From<CastError> for SstError {
     }
 }
 
-impl From<FileError> for SstError {
-    fn from(err: FileError) -> Self {
+impl From<BlobStoreError> for SstError {
+    fn from(err: BlobStoreError) -> Self {
         SstError::Internal(format!("could not write to file: {:?}", err))
+    }
+}
+
+impl From<CacheError> for SstError {
+    fn from(value: CacheError) -> Self {
+        SstError::Read(SstReadError::Cache(value))
     }
 }
 
@@ -33,12 +53,6 @@ impl From<SstError> for String {
 impl From<()> for SstError {
     fn from(_: ()) -> Self {
         SstError::Internal("".to_string())
-    }
-}
-
-impl SstError {
-    pub(crate) fn read(err: FileError) -> SstError {
-        SstError::Read(format!("could not read from file: {:?}", err))
     }
 }
 

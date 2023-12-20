@@ -54,11 +54,11 @@ mod test {
 
     fn inner_wal_write_throughput_bench<B: BlobStore + Clone + 'static>(blob_store: &B)
     where
-        B::WC: Send + Sync + 'static,
+        B::WriteCursor: Send + Sync + 'static,
     {
         let start = Instant::now();
         let wal_wrapper = WalWrapper::new(
-            blob_store.clone(),
+            blob_store,
             WalWrapperConfig::from(WalWrapperConfigPreset::MultiThreadedNoSyncRequired),
         )
         .unwrap();

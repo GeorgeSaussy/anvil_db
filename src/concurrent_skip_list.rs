@@ -707,6 +707,7 @@ impl<K: Debug, V> Debug for ConcurrentSkipListKeyView<K, V> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ConcurrentSkipListScanner<K, V: ?Sized> {
     node_wrapper: NodeWrapper<K, V>,
     end: Option<K>,
@@ -977,5 +978,74 @@ mod test {
         let index_25 = sorted_keys.iter().position(|r| r == "25").unwrap();
         let index_75 = sorted_keys.iter().position(|r| r == "75").unwrap();
         assert_eq!(count, index_75 - index_25);
+    }
+
+    #[test]
+    fn test_re_scanner() {
+        let mut to_remove = false;
+        loop {
+            // TODO(t/1388): This number should be bigger.
+            let top = 5 * 10_000_usize;
+
+            // create the skip_list
+            let mut skip_list: ConcurrentSkipList<Vec<u8>, Option<Vec<u8>>> =
+                ConcurrentSkipList::new();
+
+            // set initial values
+            let val = Some(vec![1]);
+            for i in 0..(4 * top) {
+                let idx = i as u64;
+                let key = idx.to_be_bytes();
+                skip_list.set(key, val.clone());
+            }
+
+            // interleave writing writers and scanning
+            let mut scanner = skip_list.iter();
+            let mini = top / 5 - 1;
+            for i in 0..mini {
+                let idx = (i * 5) as u64;
+
+                // set i to 2, i+1 to 0, i+2 to 3, leave i+3 as 1, and delete i+4
+                skip_list.set(idx.to_be_bytes(), vec![2]);
+                skip_list.set((idx + 1).to_be_bytes(), vec![0]);
+                skip_list.set((idx + 2).to_be_bytes(), vec![3]);
+                if to_remove {
+                    skip_list.remove(&(idx + 4).to_be_bytes().to_vec());
+                } else {
+                    skip_list.set((idx + 4).to_be_bytes(), None);
+                }
+
+                // check for deleted item from previous iteration
+                if idx != 0 && !to_remove {
+                    let view = scanner.next().unwrap();
+                    assert_eq!(view.key_ref().to_vec(), (idx - 1).to_be_bytes());
+                    assert!(view.value_ref().is_none());
+                }
+
+                // scan over the new values
+                let view = scanner.next().unwrap();
+                assert_eq!(view.key_ref().to_vec(), idx.to_be_bytes(), "idx: {}", idx);
+                assert_eq!(
+                    view.value_ref().as_ref().unwrap().to_vec(),
+                    vec![2],
+                    "idx: {}",
+                    idx
+                );
+
+                let view = scanner.next().unwrap();
+                assert_eq!(view.key_ref().to_vec(), (idx + 1).to_be_bytes());
+                assert_eq!(view.value_ref().as_ref().unwrap().to_vec(), vec![0]);
+                let view = scanner.next().unwrap();
+                assert_eq!(view.key_ref().to_vec(), (idx + 2).to_be_bytes());
+                assert_eq!(view.value_ref().as_ref().unwrap().to_vec(), vec![3]);
+                let view = scanner.next().unwrap();
+                assert_eq!(view.key_ref().to_vec(), (idx + 3).to_be_bytes());
+                assert_eq!(view.value_ref().as_ref().unwrap().to_vec(), vec![1]);
+            }
+            if to_remove {
+                break;
+            }
+            to_remove = true;
+        }
     }
 }

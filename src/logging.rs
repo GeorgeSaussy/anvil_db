@@ -1,7 +1,5 @@
-use std::{
-    fmt::{Display, Formatter},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::fmt::{Display, Formatter};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) enum LogLevel {
     Info,

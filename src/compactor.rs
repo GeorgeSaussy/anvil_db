@@ -5,38 +5,41 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread::sleep;
 use std::time::Duration;
 
+use crate::context::Context;
 use crate::kv::{
     JoinedIter, MergedHomogenousIter, TombstonePair, TombstonePairLike, TryTombstoneScanner,
 };
-use crate::logging::DefaultLogger;
 use crate::logging::{error, info};
 use crate::mem_table::MemTableCompactorIterator;
-use crate::sst::block_cache::StorageWrapper;
 use crate::sst::common::SstError;
 use crate::sst::reader::{SstReader, SstScanner};
 use crate::sst::writer::{SstWriteSettings, SstWriter};
-use crate::storage::blob_store::{BlobStore, FileError};
+use crate::storage::blob_store::{BlobStore, BlobStoreError};
 use crate::tablet::{CompactOrder, TabletSstStore, TaskCategory};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum CompactorError {
     // list of blob ids that could not be read
     FailedToObtainReader(Vec<String>),
     NothingToCompact,
     // an underlying error occurred with the blob store
-    BlobStoreError(String),
+    BlobStoreError(BlobStoreError),
+    SstError(SstError),
     DeletionError,
 }
 
-impl From<FileError> for CompactorError {
-    fn from(err: FileError) -> Self {
-        CompactorError::BlobStoreError(format!("blob store error: {:?}", err))
+impl From<BlobStoreError> for CompactorError {
+    fn from(err: BlobStoreError) -> Self {
+        CompactorError::BlobStoreError(err)
     }
 }
 
 impl From<SstError> for CompactorError {
     fn from(err: SstError) -> Self {
-        CompactorError::BlobStoreError(format!("blob store error (via SST error): {:?}", err))
+        match err {
+            SstError::EmptySst(_) => CompactorError::NothingToCompact,
+            _ => CompactorError::SstError(err),
+        }
     }
 }
 
@@ -80,6 +83,36 @@ struct DebugOrder {
     levels: Option<HashMap<usize, Vec<String>>>,
 }
 
+pub(crate) struct CompactorSettings {
+    target_block_size: usize,
+    target_keys_per_block: usize,
+}
+
+impl Default for CompactorSettings {
+    fn default() -> Self {
+        let target_block_size = 128 * 1024 * 1024;
+        let target_keys_per_block = target_block_size / 32;
+        Self {
+            target_block_size,
+            target_keys_per_block,
+        }
+    }
+}
+
+impl CompactorSettings {
+    pub(crate) fn with_target_block_size(mut self, target_block_size: usize) -> Self {
+        self.target_block_size = target_block_size;
+        self.target_keys_per_block = target_block_size / 32;
+        self
+    }
+
+    fn apply(&self, write_settings: SstWriteSettings) -> SstWriteSettings {
+        write_settings
+            .with_target_block_size(self.target_block_size)
+            .with_target_keys_per_block(self.target_keys_per_block)
+    }
+}
+
 /// Compactor encapsulates the state of the compactions.
 /// The Compactor is a data structure that will actually perform
 /// compactions for the embedded jupiter instance. For each
@@ -99,52 +132,68 @@ struct DebugOrder {
 /// wrote. A finished compaction call may not be successful if
 /// another compactor has already compacted one of the input files.
 /// In this case the compactors work was wasted.
-pub(crate) struct Compactor<BC: StorageWrapper, T: TabletSstStore> {
-    storage_wrapper: BC,
+///
+/// TODO(t/1336): The compactor acts as a background thread processor.
+/// It should probably be refactored with the following in mind:
+///
+/// 1. be multithreaded
+/// 2. use an async job scheduling
+pub(crate) struct Compactor<Ctx: Context, T: TabletSstStore> {
+    ctx: Ctx,
     /// a pointer to the manifest that is being compacted
     sst_store: T,
+    settings: CompactorSettings,
     /// false if the compactor should stop running
     admin_rx: Receiver<CompactorMessage>,
     garbage_queue: Vec<String>,
     /// passed to new `SstReader` instances upon creation
     compactor_tx: Sender<CompactorMessage>,
-    logger: DefaultLogger,
 }
 
-impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> Compactor<BC, T> {
+impl<Ctx: Context, T: TabletSstStore> Compactor<Ctx, T> {
     pub(crate) fn new(
-        storage_wrapper: BC,
+        ctx: Ctx,
         sst_store: T,
+        settings: CompactorSettings,
         compactor_tx: Sender<CompactorMessage>,
         admin_rx: Receiver<CompactorMessage>,
     ) -> Self {
-        // TODO(t/1380): This should be a reference to a logger that is passed
-        // as an argument when the compactor is created.
-        let logger = DefaultLogger::default();
         Compactor {
-            storage_wrapper,
+            ctx,
             sst_store,
+            settings,
             admin_rx,
             garbage_queue: Vec::new(),
             compactor_tx,
-            logger,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn one_off(storage_wrapper: BC, sst_store: T) -> Self {
+    pub(crate) fn one_off(ctx: Ctx, sst_store: T) -> Self {
         use std::sync::mpsc::channel;
 
         let (compactor_tx, compactor_rx) = channel::<CompactorMessage>();
-        Compactor::new(storage_wrapper, sst_store, compactor_tx, compactor_rx)
+        Compactor::new(
+            ctx,
+            sst_store,
+            CompactorSettings::default(),
+            compactor_tx,
+            compactor_rx,
+        )
     }
 
     fn tombstone_iter(
-        sst_readers: &[SstReader<BC>],
-    ) -> Result<MergedHomogenousIter<SstScanner<BC>>, CompactorError> {
+        storage_wrapper: &Ctx,
+        sst_readers: &[SstReader],
+    ) -> Result<MergedHomogenousIter<SstScanner<Ctx>>, CompactorError> {
         let results = sst_readers
             .iter()
-            .map(|reader| (reader.blob_id_ref().to_string(), reader.try_scan()))
+            .map(|reader| {
+                (
+                    reader.blob_id_ref().to_string(),
+                    reader.try_scan(storage_wrapper),
+                )
+            })
             .collect::<Vec<_>>();
         let mut failed_blob_ids = Vec::with_capacity(sst_readers.len());
         for (blob_id, result) in results.iter() {
@@ -163,13 +212,13 @@ impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> Compactor<BC, T> {
 
     fn fill_minor_order(
         &self,
-        minor_sst_readers: &[SstReader<BC>],
-        l0_sst_readers: &[SstReader<BC>],
-        write_settings: &SstWriteSettings,
-    ) -> Result<Vec<SstReader<BC>>, CompactorError> {
-        let minor_iter = Compactor::<BC, T>::tombstone_iter(minor_sst_readers)?;
-        let l0_iter = Compactor::<BC, T>::tombstone_iter(l0_sst_readers)?;
-        let merged_iter = JoinedIter::new(minor_iter, l0_iter);
+        minor_sst_readers: &[SstReader],
+        l0_sst_readers: &[SstReader],
+        write_settings: SstWriteSettings,
+    ) -> Result<Vec<SstReader>, CompactorError> {
+        let minor_iter = Compactor::<Ctx, T>::tombstone_iter(&self.ctx, minor_sst_readers)?;
+        let l0_iter = Compactor::<Ctx, T>::tombstone_iter(&self.ctx, l0_sst_readers)?;
+        let merged_iter: JoinedIter<SstError, _, _> = JoinedIter::new(minor_iter, l0_iter);
         let debug_data = DebugOrder {
             order_type: "minor".to_string(),
             minor_ssts: Some(
@@ -191,19 +240,19 @@ impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> Compactor<BC, T> {
             ),
         };
         let debug_message = format!("{:?}", debug_data);
-        self.compact(&debug_message, merged_iter, write_settings)
+        self.compact(&debug_message, merged_iter, &write_settings)
     }
 
     fn fill_regular_order(
         &self,
-        lo_sst_readers: &[SstReader<BC>],
-        hi_sst_readers: &[SstReader<BC>],
+        lo_sst_readers: &[SstReader],
+        hi_sst_readers: &[SstReader],
         target_level: usize,
-        write_settings: &SstWriteSettings,
-    ) -> Result<Vec<SstReader<BC>>, CompactorError> {
-        let lo_iter = Compactor::<BC, T>::tombstone_iter(lo_sst_readers)?;
-        let hi_iter = Compactor::<BC, T>::tombstone_iter(hi_sst_readers)?;
-        let merged_iter = JoinedIter::new(lo_iter, hi_iter);
+        write_settings: SstWriteSettings,
+    ) -> Result<Vec<SstReader>, CompactorError> {
+        let lo_iter = Compactor::<Ctx, T>::tombstone_iter(&self.ctx, lo_sst_readers)?;
+        let hi_iter = Compactor::<Ctx, T>::tombstone_iter(&self.ctx, hi_sst_readers)?;
+        let merged_iter: JoinedIter<SstError, _, _> = JoinedIter::new(lo_iter, hi_iter);
         let debug_level_map = zip(
             [target_level - 1, target_level].iter(),
             [lo_sst_readers, hi_sst_readers].iter(),
@@ -224,22 +273,24 @@ impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> Compactor<BC, T> {
             levels: Some(debug_level_map),
         };
         let debug_message = format!("{:?}", debug_data);
-        self.compact(&debug_message, merged_iter, write_settings)
+        self.compact(&debug_message, merged_iter, &write_settings)
     }
 
     fn fill_major_order(
         &self,
-        minor_sst_readers: &[SstReader<BC>],
-        level_sst_readers: &[Vec<SstReader<BC>>],
-        write_settings: &SstWriteSettings,
-    ) -> Result<Vec<SstReader<BC>>, CompactorError> {
-        let minor_iter = Compactor::<BC, T>::tombstone_iter(minor_sst_readers)?;
+        minor_sst_readers: &[SstReader],
+        level_sst_readers: &[Vec<SstReader>],
+        write_settings: SstWriteSettings,
+    ) -> Result<Vec<SstReader>, CompactorError> {
+        let minor_iter = Compactor::<Ctx, T>::tombstone_iter(&self.ctx, minor_sst_readers)?;
         let level_iters = level_sst_readers
             .iter()
-            .map(|level_sst_readers| Compactor::<BC, T>::tombstone_iter(level_sst_readers))
+            .map(|level_sst_readers| {
+                Compactor::<Ctx, T>::tombstone_iter(&self.ctx, level_sst_readers)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let level_iter = MergedHomogenousIter::new(level_iters.into_iter());
-        let merged_iter = JoinedIter::new(minor_iter, level_iter);
+        let merged_iter: JoinedIter<SstError, _, _> = JoinedIter::new(minor_iter, level_iter);
         let debug_level_map = level_sst_readers
             .iter()
             .enumerate()
@@ -265,7 +316,7 @@ impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> Compactor<BC, T> {
             levels: Some(debug_level_map),
         };
         let debug_message = format!("{:?}", debug_data);
-        self.compact(&debug_message, merged_iter, write_settings)
+        self.compact(&debug_message, merged_iter, &write_settings)
     }
 
     /// # Returns
@@ -276,11 +327,11 @@ impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> Compactor<BC, T> {
         debug_message: &str,
         pairs: I,
         settings: &SstWriteSettings,
-    ) -> Result<Vec<SstReader<BC>>, CompactorError>
+    ) -> Result<Vec<SstReader>, CompactorError>
     where
         SstError: From<E>,
     {
-        let blob_store = self.storage_wrapper.blob_store_ref().clone();
+        let blob_store = self.ctx.blob_store_ref().clone();
 
         let writer = SstWriter::new(blob_store, settings.clone());
         let blob_ids = writer.write_all(pairs)?;
@@ -288,7 +339,7 @@ impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> Compactor<BC, T> {
             .iter()
             .map(|blob_id| {
                 SstReader::new(
-                    self.storage_wrapper.clone(),
+                    self.ctx.blob_store_ref(),
                     blob_id,
                     self.compactor_tx.clone(),
                 )
@@ -296,22 +347,23 @@ impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> Compactor<BC, T> {
             .collect::<Result<Vec<_>, _>>()?;
 
         info!(
-            &self.logger,
+            self.ctx.logger(),
             "compacted to new blobs {:?} from original order {}", blob_ids, debug_message,
         );
         Ok(readers)
     }
 
-    fn compact_result(
-        &self,
-        order: &CompactOrder<BC>,
-    ) -> Result<Vec<SstReader<BC>>, CompactorError> {
+    fn compact_result(&self, order: &CompactOrder) -> Result<Vec<SstReader>, CompactorError> {
         match &order {
             CompactOrder::Minor {
                 minor_sst_readers,
                 l0_sst_readers,
                 write_settings,
-            } => self.fill_minor_order(minor_sst_readers, l0_sst_readers, write_settings),
+            } => self.fill_minor_order(
+                minor_sst_readers,
+                l0_sst_readers,
+                self.settings.apply(write_settings.clone()),
+            ),
             CompactOrder::Regular {
                 lo_sst_readers,
                 hi_sst_readers,
@@ -321,19 +373,22 @@ impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> Compactor<BC, T> {
                 lo_sst_readers,
                 hi_sst_readers,
                 *target_level_no,
-                write_settings,
+                self.settings.apply(write_settings.clone()),
             ),
             CompactOrder::Major {
                 minor_sst_readers,
                 level_sst_readers,
                 write_settings,
                 ..
-            } => self.fill_major_order(minor_sst_readers, level_sst_readers, write_settings),
+            } => self.fill_major_order(
+                minor_sst_readers,
+                level_sst_readers,
+                self.settings.apply(write_settings.clone()),
+            ),
         }
     }
 
     pub(crate) fn run(mut self) -> Result<(), CompactorError> {
-        let blob_store = self.storage_wrapper.blob_store_ref().clone();
         let short_time = Duration::from_millis(500);
         loop {
             sleep(short_time);
@@ -362,7 +417,7 @@ impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> Compactor<BC, T> {
                         }
                     }
                     CompactorMessage::GarbageCollect { blob_ids, done_tx } => {
-                        let result = self.inner_garbage_collect(&blob_store, &blob_ids);
+                        let result = self.inner_garbage_collect(&blob_ids);
                         if let Some(done_tx) = done_tx {
                             done_tx
                                 .send(match result {
@@ -374,7 +429,7 @@ impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> Compactor<BC, T> {
                     }
                     CompactorMessage::DeleteBlob(blob_id) => {
                         let blob_ids = vec![blob_id];
-                        _ = self.inner_garbage_collect(&blob_store, &blob_ids);
+                        _ = self.inner_garbage_collect(&blob_ids);
                     }
                 }
                 continue;
@@ -388,24 +443,20 @@ impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> Compactor<BC, T> {
                 }
             }
 
-            let _ = self.inner_garbage_collect(&blob_store, &[]);
+            let _ = self.inner_garbage_collect(&[]);
         }
     }
 
-    fn inner_garbage_collect(
-        &mut self,
-        blob_store: &BC::B,
-        blob_ids: &[String],
-    ) -> Result<(), CompactorError> {
+    fn inner_garbage_collect(&mut self, blob_ids: &[String]) -> Result<(), CompactorError> {
         let old_gq = self.garbage_queue.clone().into_iter().map(|s| (true, s));
         let new_gq = blob_ids.iter().map(|s| (false, s.to_string()));
         self.garbage_queue = Vec::with_capacity(old_gq.len());
         let mut err_found = false;
         for (is_old, blob_id) in old_gq.chain(new_gq) {
-            match blob_store.delete(&blob_id) {
+            match self.ctx.blob_store_ref().delete(&blob_id) {
                 Ok(_) => {
                     if is_old {
-                        info!(&self.logger, "garbage collected old blob: {}", blob_id);
+                        info!(self.ctx.logger(), "garbage collected old blob: {}", blob_id);
                     }
                 }
                 Err(_) => {
@@ -413,7 +464,7 @@ impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> Compactor<BC, T> {
                         err_found = true;
                     }
                     error!(
-                        &self.logger,
+                        self.ctx.logger(),
                         "failed to garbage collect old blob, requeuing for later: {}", blob_id
                     );
                     self.garbage_queue.push(blob_id);
@@ -443,26 +494,33 @@ impl<BC: StorageWrapper, T: TabletSstStore<BC = BC>> Compactor<BC, T> {
         &mut self,
         iter: I,
     ) -> Result<String, CompactorError> {
-        let blob_store = self.storage_wrapper.blob_store_ref().clone();
+        let blob_store = self.ctx.blob_store_ref().clone();
 
         let writer = SstWriter::new(
             blob_store,
-            self.sst_store
-                .write_settings_ref()
-                .clone()
-                .keep_tombstones()
-                .set_writing_minor_sst(true),
+            self.settings.apply(
+                self.sst_store
+                    .write_settings_ref()
+                    .clone()
+                    .keep_tombstones()
+                    .set_writing_minor_sst(true),
+            ),
         );
         let pairs = iter.map(|pair| Ok::<L, ()>(pair));
         let mut blob_ids = writer.write_all(pairs)?;
+        info!(
+            self.ctx.logger(),
+            "compacted new minor sst list {:?}", blob_ids
+        );
         debug_assert_eq!(blob_ids.len(), 1);
         let blob_id = blob_ids.pop().unwrap();
         let reader = SstReader::new(
-            self.storage_wrapper.clone(),
+            self.ctx.blob_store_ref(),
             &blob_id,
             self.compactor_tx.clone(),
         )?;
         self.sst_store.add_minor_sst(reader);
+        info!(self.ctx.logger(), "compacted new minor sst {}", blob_id);
         Ok(blob_id)
     }
 }
@@ -475,8 +533,12 @@ mod test {
     use super::*;
     use crate::compactor::{Compactor, CompactorMessage};
     use crate::concurrent_skip_list::ConcurrentSkipList;
+    use crate::context::SimpleContext;
+    use crate::helpful_macros::unwrap;
     use crate::kv::{TombstonePair, TombstoneValue};
-    use crate::sst::block_cache::{BlockCache, NoBlockCache, SimpleStorageWrapper, StorageWrapper};
+    use crate::logging::DefaultLogger;
+    use crate::sst::block_cache::cache::LruBlockCache;
+    use crate::sst::block_cache::BlockCache;
     use crate::sst::writer::SstWriteSettings;
     use crate::storage::blob_store::InMemoryBlobStore;
     use crate::tablet::SmartTablet;
@@ -507,11 +569,11 @@ mod test {
 
     type BlobId = String;
 
-    fn write_minor_md<BC: StorageWrapper>(
-        storage_wrapper: &BC,
+    fn write_minor_md<Ctx: Context>(
+        ctx: &Ctx,
         vec: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<BlobId, String> {
-        let blob_store = storage_wrapper.blob_store_ref().clone();
+        let blob_store = ctx.blob_store_ref().clone();
         let sst_writer = SstWriter::new(
             blob_store,
             SstWriteSettings::default().set_writing_minor_sst(true),
@@ -523,9 +585,8 @@ mod test {
         Ok(blob_ids[0].clone())
     }
 
-    fn check_written<BC: StorageWrapper, E: Debug, I: Iterator<Item = Result<TombstonePair, E>>>(
-        _storage_wrapper: &BC,
-        vec: &Vec<(Vec<u8>, Vec<u8>)>,
+    fn check_written<E: Debug, I: Iterator<Item = Result<TombstonePair, E>>>(
+        vec: &[(Vec<u8>, Vec<u8>)],
         pairs: I,
     ) -> Result<(), String> {
         for (idx, result) in pairs.enumerate() {
@@ -540,38 +601,38 @@ mod test {
         Ok(())
     }
 
-    fn write_starting_sst_vec<BC: StorageWrapper>(
-        storage_wrapper: &BC,
+    fn write_starting_sst_vec<Ctx: Context>(
+        ctx: &Ctx,
         compactor_tx: Sender<CompactorMessage>,
-    ) -> Result<Vec<SstReader<BC>>, String> {
+    ) -> Result<Vec<SstReader>, String> {
         let mut readers = Vec::with_capacity(3);
 
         let data = md_n_data(1);
-        let path_1 = write_minor_md(storage_wrapper, &data).unwrap();
+        let path_1 = write_minor_md(ctx, &data).unwrap();
         readers.push(SstReader::new(
-            storage_wrapper.clone(),
+            ctx.blob_store_ref(),
             &path_1,
             compactor_tx.clone(),
         )?);
-        check_written(storage_wrapper, &data, readers[0].try_scan().unwrap()).unwrap();
+        unwrap!(check_written(&data, unwrap!(readers[0].try_scan(ctx))));
 
         let data = md_n_data(2);
-        let path_2 = write_minor_md(storage_wrapper, &data).unwrap();
+        let path_2 = unwrap!(write_minor_md(ctx, &data));
         readers.push(SstReader::new(
-            storage_wrapper.clone(),
+            ctx.blob_store_ref(),
             &path_2,
             compactor_tx.clone(),
         )?);
-        check_written(storage_wrapper, &data, readers[1].try_scan().unwrap()).unwrap();
+        unwrap!(check_written(&data, unwrap!(readers[1].try_scan(ctx))));
 
         let data = md_n_data(3);
-        let path_3 = write_minor_md(storage_wrapper, &data).unwrap();
+        let path_3 = unwrap!(write_minor_md(ctx, &data));
         readers.push(SstReader::new(
-            storage_wrapper.clone(),
+            ctx.blob_store_ref(),
             &path_3,
             compactor_tx.clone(),
         )?);
-        check_written(storage_wrapper, &data, readers[2].try_scan().unwrap()).unwrap();
+        unwrap!(check_written(&data, unwrap!(readers[2].try_scan(ctx))));
 
         Ok(readers)
     }
@@ -579,29 +640,30 @@ mod test {
     #[test]
     fn test_compactor_compact() {
         let blob_store = InMemoryBlobStore::new();
-        // TODO(t/1387): This test should be run with the LRU block cache
-        // when possible.
-        type TestOnlyStorageWrapper = SimpleStorageWrapper<InMemoryBlobStore, NoBlockCache>;
-        let storage_wrapper =
-            SimpleStorageWrapper::from((blob_store, NoBlockCache::with_capacity(0)));
-        type TestOnlyTabletSstStore = SmartTablet<TestOnlyStorageWrapper>;
+        let ctx = SimpleContext::from((
+            blob_store,
+            LruBlockCache::with_capacity(32),
+            DefaultLogger::default(),
+        ));
         let levels: Vec<String> = Vec::new();
         let (compactor_tx, compactor_rx) = channel::<CompactorMessage>();
-        let sst_store = TestOnlyTabletSstStore::new(
-            storage_wrapper.clone(),
+        let sst_store = unwrap!(SmartTablet::new(
+            ctx.blob_store_ref(),
             levels.into_iter(),
             compactor_tx.clone(),
-        )
-        .unwrap();
+        ));
         let compactor = Compactor::new(
-            storage_wrapper.clone(),
+            ctx.clone(),
             sst_store.clone(),
+            CompactorSettings::default(),
             compactor_tx.clone(),
             compactor_rx,
         );
 
-        let sst_readers = write_starting_sst_vec(&storage_wrapper, compactor_tx.clone()).unwrap();
-        let pairs = sst_readers.iter().map(|reader| reader.try_scan().unwrap());
+        let sst_readers = unwrap!(write_starting_sst_vec(&ctx, compactor_tx.clone()));
+        let pairs = sst_readers
+            .iter()
+            .map(|reader| unwrap!(reader.try_scan(&ctx)));
         let pairs = MergedHomogenousIter::new(pairs);
         let new_sst_readers = compactor
             .compact("'my blobs!'", pairs, &SstWriteSettings::default())
@@ -624,8 +686,8 @@ mod test {
 
         let new_iters = new_sst_readers
             .iter()
-            .map(|reader| reader.try_scan().unwrap());
+            .map(|reader| unwrap!(reader.try_scan(&ctx)));
         let pairs = MergedHomogenousIter::new(new_iters);
-        assert!(check_written(&storage_wrapper, &out_data, pairs).is_ok())
+        assert!(check_written(&out_data, pairs).is_ok())
     }
 }

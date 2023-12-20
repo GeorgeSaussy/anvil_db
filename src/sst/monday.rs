@@ -5,13 +5,16 @@ mod test {
     use std::sync::mpsc::channel;
 
     use crate::common::cmp_key;
+    use crate::context::Context;
+    use crate::context::SimpleContext;
+    use crate::helpful_macros::unwrap;
     use crate::kv::TombstonePair;
     use crate::kv::TombstonePointReader;
     use crate::kv::TryTombstoneScanner;
     use crate::logging::debug;
+    use crate::logging::DefaultLogger;
+    use crate::sst::block_cache::cache::LruBlockCache;
     use crate::sst::block_cache::BlockCache;
-    use crate::sst::block_cache::NoBlockCache;
-    use crate::sst::block_cache::SimpleStorageWrapper;
     use crate::sst::reader::SstReader;
     use crate::sst::writer::SstWriteSettings;
     use crate::sst::writer::SstWriter;
@@ -84,13 +87,18 @@ mod test {
             debug!("starting bytes in SST file: {:?}", buf);
         }
 
-        let storage_wrapper =
-            SimpleStorageWrapper::from((store.clone(), NoBlockCache::with_capacity(0)));
-
+        let ctx = SimpleContext::from((
+            store.clone(),
+            LruBlockCache::with_capacity(32),
+            DefaultLogger::default(),
+        ));
         // test scan
-        let reader = SstReader::new(storage_wrapper, sst_blob_id, compactor_tx)
-            .expect("could not get reader");
-        let mut scanner = reader.try_scan().expect("could not open scanner");
+        let reader = unwrap!(SstReader::new(
+            ctx.blob_store_ref(),
+            sst_blob_id,
+            compactor_tx
+        ));
+        let mut scanner = unwrap!(reader.try_scan(&ctx));
         let pair = scanner.start().expect("could not start scanner");
         assert_eq!(cmp_key(pair.key_ref(), &keys[0]), Ordering::Equal);
         let value_ref = pair.value_ref();
@@ -123,7 +131,7 @@ mod test {
 
         for _ in 0..2 {
             let k = 0;
-            let option = reader.get(&keys[k]).expect("could not get key");
+            let option = reader.get(&ctx, &keys[k]).expect("could not get key");
             let value = option.unwrap();
             match value.as_ref() {
                 Some(value) => {
@@ -134,7 +142,7 @@ mod test {
         }
 
         for k in 1..top {
-            let option = reader.get(&keys[k]).expect("could not get key");
+            let option = reader.get(&ctx, &keys[k]).expect("could not get key");
             let value = option.unwrap();
             match value.as_ref() {
                 Some(value) => {

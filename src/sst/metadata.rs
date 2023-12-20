@@ -1,3 +1,4 @@
+use super::common::SstReadError;
 use crate::bloom_filter::BasicBloomFilter;
 use crate::bloom_filter::BloomFilter;
 use crate::common::join_byte_arrays;
@@ -141,42 +142,52 @@ pub(crate) struct MetadataBlock {
 }
 
 impl MetadataBlock {
-    pub(crate) fn from_blob<BS: BlobStore>(
-        store: BS,
+    pub(crate) fn from_blob<B: BlobStore>(
+        store: &B,
         blob_id: &str,
     ) -> Result<(MetadataBlock, usize), SstError> {
         let mut cursor = match store.read_cursor(blob_id) {
             Ok(rc) => rc,
-            Err(err) => return Err(SstError::read(err)),
+            Err(err) => {
+                return Err(
+                    SstReadError::BlobStore((format!("blob_id: {:?}", blob_id), err)).into(),
+                )
+            }
         };
         let blob_size = cursor.size()?;
         if let Err(err) = cursor.seek_from_end(8_usize) {
-            return Err(SstError::Read(format!(
-                "could not seek to offset 8 from end: {:?}",
-                err
-            )));
+            return Err(SstReadError::BlobStore((
+                "could not seek to offset 8 from end".to_string(),
+                err,
+            ))
+            .into());
         }
         let mut buf = [0_u8; 8];
         if let Err(err) = cursor.read_exact(&mut buf) {
-            return Err(SstError::Read(format!(
-                "could not read metadata length from file: {:?}",
-                err
-            )));
+            return Err(SstReadError::BlobStore((
+                "could not read metadata length from file".to_string(),
+                err,
+            ))
+            .into());
         }
         let metadata_len = try_usize(u64::from_be_bytes(buf))?;
         if let Err(err) = cursor.seek_from_end(8_usize + metadata_len) {
-            return Err(SstError::Read(format!(
-                "could not seek to offset {} kb from end: {:?}",
-                (8_usize + metadata_len) / 1024,
-                err
-            )));
+            return Err(SstReadError::BlobStore((
+                format!(
+                    "could not seek to offset {} kb from end",
+                    (8_usize + metadata_len) / 1024
+                ),
+                err,
+            ))
+            .into());
         }
         let mut buf = vec![0; metadata_len];
         if let Err(err) = cursor.read_exact(&mut buf) {
-            return Err(SstError::Read(format!(
-                "could not read metadata from file: {:?}",
-                err
-            )));
+            return Err(SstReadError::BlobStore((
+                "could not read metadata from file: {:?}".to_string(),
+                err,
+            ))
+            .into());
         }
         let metadata_block = match MetadataBlock::try_from(buf.as_slice()) {
             Ok(x) => x,

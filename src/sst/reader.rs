@@ -1,23 +1,27 @@
 use std::cmp::Ordering;
+use std::fmt::{Debug, Formatter};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use super::block_cache::StorageWrapper;
+use super::block_cache::block_scanner::BlockScanner;
+use super::common::SstReadError;
 use crate::bloom_filter::BasicBloomFilter;
 use crate::bloom_filter::BloomFilter;
 use crate::common::cmp_key;
 use crate::common::try_usize;
 use crate::compactor::CompactorMessage;
-use crate::kv::TombstoneIterator;
+use crate::context::Context;
 use crate::kv::TombstonePair;
 use crate::kv::TombstonePointReader;
 use crate::kv::TombstoneValue;
 use crate::kv::TryTombstoneScanner;
+use crate::kv::{RangeSet, TombstoneIterator};
+use crate::logging::error;
 use crate::sst::common::KeyRange;
 use crate::sst::common::KeyRangeCmp;
 use crate::sst::common::SstError;
 use crate::sst::metadata::MetadataBlock;
-use crate::storage::blob_store::{BlobStore, ReadCursor};
+use crate::storage::blob_store::BlobStore;
 use crate::var_int::VarInt64;
 
 #[derive(Debug)]
@@ -43,65 +47,36 @@ impl Drop for BlobDropper {
     }
 }
 
-struct CachedReader<BC: StorageWrapper> {
-    storage_wrapper: BC,
-    blob_id: String,
-    to_skip: usize,
-    reader: Option<<<BC as StorageWrapper>::B as BlobStore>::RC>,
-}
-
-// TODO(t/1387): This does not actually use the block cache.
-impl<BC: StorageWrapper> CachedReader<BC> {
-    fn skip(&mut self, offset: usize) -> Result<(), SstError> {
-        self.to_skip = offset;
-        Ok(())
-    }
-
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), SstError> {
-        if let Some(reader) = self.reader.as_mut() {
-            reader.read_exact(buf)?;
-            return Ok(());
-        }
-        let blob_store = self.storage_wrapper.blob_store_ref();
-        let mut reader = blob_store.read_cursor(&self.blob_id)?;
-        if self.to_skip > 0 {
-            reader.skip(self.to_skip)?;
-            self.to_skip = 0;
-        }
-        reader.read_exact(buf)?;
-        self.reader = Some(reader);
-        Ok(())
-    }
-}
-
-pub(crate) struct SstScanner<BC: StorageWrapper> {
-    reader: CachedReader<BC>,
+pub(crate) struct SstScanner<Ctx: Context> {
+    ctx: Ctx,
+    meta: ThinSstMetadata,
+    reader: BlockScanner,
     buffer: Vec<u8>,
     previous_key: Vec<u8>,
     return_next: Option<TombstonePair>,
     last_key: Option<Vec<u8>>,
     poisoned: bool,
     done: bool,
-    #[allow(dead_code)]
-    blob_dropper: Arc<BlobDropper>,
 }
 
-impl<BC: StorageWrapper> SstScanner<BC> {
+impl<Ctx: Context> Debug for SstScanner<Ctx> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SstScanner").finish()
+    }
+}
+
+impl<Ctx: Context> SstScanner<Ctx> {
     fn new(
-        storage_wrapper: BC,
-        blob_id: &str,
+        ctx: Ctx,
+        meta: ThinSstMetadata,
         last_key: Option<Vec<u8>>,
         offset: usize,
-        blob_dropper: Arc<BlobDropper>,
-    ) -> Result<SstScanner<BC>, SstError> {
-        let mut reader = CachedReader {
-            storage_wrapper,
-            blob_id: blob_id.to_string(),
-            to_skip: 0,
-            reader: None,
-        };
+    ) -> Result<SstScanner<Ctx>, SstError> {
+        let mut reader = BlockScanner::new(meta.blob_id_ref());
         reader.skip(offset)?;
         Ok(SstScanner {
+            ctx,
+            meta,
             reader,
             buffer: Vec::new(),
             previous_key: Vec::new(),
@@ -109,7 +84,6 @@ impl<BC: StorageWrapper> SstScanner<BC> {
             last_key,
             poisoned: false,
             done: false,
-            blob_dropper,
         })
     }
 
@@ -142,40 +116,45 @@ impl<BC: StorageWrapper> SstScanner<BC> {
 
         // common len
         let mut buf = vec![0_u8; 8 - self.buffer.len()];
-        if let Err(err) = self.reader.read_exact(&mut buf) {
-            return Some(self.poison(SstError::Read(format!(
-                "could not read from file: {:?}",
-                err
-            ))));
+        if let Err(err) = self.reader.read_exact(&self.ctx, &self.meta, &mut buf) {
+            error!(self.ctx.logger(), "foo 1");
+            return Some(self.poison(SstReadError::Cache(err).into()));
         }
         self.buffer.extend_from_slice(&buf);
         let common_len = match VarInt64::try_from(self.buffer.as_slice()) {
             Ok(var_int) => var_int,
             Err(err) => {
-                return Some(self.poison(SstError::Read(format!(
-                    "could not parse a VarInt64 from bytes: {:?}",
-                    err
-                ))));
+                return Some(
+                    self.poison(
+                        SstReadError::PossibleCorruption(format!(
+                            "could not parse a VarInt64 from bytes: {:?}",
+                            err
+                        ))
+                        .into(),
+                    ),
+                );
             }
         };
         self.buffer = self.buffer[common_len.len()..].to_vec();
 
         // diff_len
         let mut buf = vec![0_u8; 8 - self.buffer.len()];
-        if let Err(err) = self.reader.read_exact(&mut buf) {
-            return Some(self.poison(SstError::Read(format!(
-                "could not read from file: {:?}",
-                err
-            ))));
+        if let Err(err) = self.reader.read_exact(&self.ctx, &self.meta, &mut buf) {
+            return Some(self.poison(SstReadError::Cache(err).into()));
         }
         self.buffer.extend_from_slice(&buf);
         let diff_len = match VarInt64::try_from(self.buffer.as_slice()) {
             Ok(var_int) => var_int,
             Err(err) => {
-                return Some(self.poison(SstError::Read(format!(
-                    "could not parse a VarInt64 from bytes: {:?}",
-                    err
-                ))));
+                return Some(
+                    self.poison(
+                        SstReadError::PossibleCorruption(format!(
+                            "could not parse a VarInt64 from bytes: {:?}",
+                            err
+                        ))
+                        .into(),
+                    ),
+                );
             }
         };
         self.buffer = self.buffer[diff_len.len()..].to_vec();
@@ -187,11 +166,8 @@ impl<BC: StorageWrapper> SstScanner<BC> {
         };
         if self.buffer.len() < diff_len_value {
             let mut buf = vec![0_u8; diff_len_value - self.buffer.len()];
-            if let Err(err) = self.reader.read_exact(&mut buf) {
-                return Some(self.poison(SstError::Read(format!(
-                    "could not read from file: {:?}",
-                    err
-                ))));
+            if let Err(err) = self.reader.read_exact(&self.ctx, &self.meta, &mut buf) {
+                return Some(self.poison(SstReadError::Cache(err).into()));
             }
             self.buffer.extend_from_slice(&buf);
         }
@@ -204,11 +180,16 @@ impl<BC: StorageWrapper> SstScanner<BC> {
             Err(err) => return Some(self.poison(err.into())),
         };
         if common_len_value > self.previous_key.len() {
-            return Some(self.poison(SstError::Read(format!(
-                "common_len_value is greater than previous_key.len(): {} > {}",
-                common_len_value,
-                self.previous_key.len()
-            ))));
+            return Some(
+                self.poison(
+                    SstReadError::PossibleCorruption(format!(
+                        "common_len_value is greater than previous_key.len(): {} > {}",
+                        common_len_value,
+                        self.previous_key.len()
+                    ))
+                    .into(),
+                ),
+            );
         }
         let common = self.previous_key[0..common_len_value].to_vec();
         let key = [common, key_diff].concat();
@@ -216,11 +197,8 @@ impl<BC: StorageWrapper> SstScanner<BC> {
         // parse value_or_del_mark
         if self.buffer.is_empty() {
             let mut buf = [0_u8];
-            if let Err(err) = self.reader.read_exact(&mut buf) {
-                return Some(self.poison(SstError::Read(format!(
-                    "could not read from file: {:?}",
-                    err
-                ))));
+            if let Err(err) = self.reader.read_exact(&self.ctx, &self.meta, &mut buf) {
+                return Some(self.poison(SstReadError::Cache(err).into()));
             }
             self.buffer.extend_from_slice(&buf);
         }
@@ -233,11 +211,8 @@ impl<BC: StorageWrapper> SstScanner<BC> {
         // parse val_len
         if self.buffer.len() < 8 {
             let mut buf = vec![0_u8; 8 - self.buffer.len()];
-            if let Err(err) = self.reader.read_exact(&mut buf) {
-                return Some(self.poison(SstError::Read(format!(
-                    "could not read from file: {:?}",
-                    err
-                ))));
+            if let Err(err) = self.reader.read_exact(&self.ctx, &self.meta, &mut buf) {
+                return Some(self.poison(SstReadError::Cache(err).into()));
             }
             self.buffer.extend_from_slice(&buf);
         }
@@ -245,21 +220,23 @@ impl<BC: StorageWrapper> SstScanner<BC> {
         let val_len = match VarInt64::try_from(self.buffer.as_slice()) {
             Ok(var_int) => var_int,
             Err(err) => {
-                return Some(self.poison(SstError::Read(format!(
-                    "could not parse a VarInt64 from bytes: {:?}",
-                    err
-                ))))
+                return Some(
+                    self.poison(
+                        SstReadError::PossibleCorruption(format!(
+                            "could not parse a VarInt64 from bytes: {:?}",
+                            err
+                        ))
+                        .into(),
+                    ),
+                )
             }
         };
         self.buffer = self.buffer[val_len.len()..].to_vec();
 
         if self.buffer.len() < val_len.value() as usize {
             let mut buf = vec![0_u8; val_len.value() as usize - self.buffer.len()];
-            if let Err(err) = self.reader.read_exact(&mut buf) {
-                return Some(self.poison(SstError::Read(format!(
-                    "could not read from file: {:?}",
-                    err
-                ))));
+            if let Err(err) = self.reader.read_exact(&self.ctx, &self.meta, &mut buf) {
+                return Some(self.poison(SstReadError::Cache(err).into()));
             }
             self.buffer.extend_from_slice(&buf);
         }
@@ -276,7 +253,7 @@ impl<BC: StorageWrapper> SstScanner<BC> {
     }
 }
 
-impl<BC: StorageWrapper> Iterator for SstScanner<BC> {
+impl<Ctx: Context> Iterator for SstScanner<Ctx> {
     type Item = Result<TombstonePair, SstError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -284,9 +261,7 @@ impl<BC: StorageWrapper> Iterator for SstScanner<BC> {
     }
 }
 
-impl<BC: StorageWrapper> TombstoneIterator for SstScanner<BC> {
-    type E = SstError;
-
+impl<Ctx: Context> RangeSet for SstScanner<Ctx> {
     fn from(mut self, key: &[u8]) -> Self {
         loop {
             if let Some(Ok(pair)) = self.next() {
@@ -306,84 +281,132 @@ impl<BC: StorageWrapper> TombstoneIterator for SstScanner<BC> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct SstReader<BC: StorageWrapper> {
-    storage_wrapper: BC,
-    blob_id: String,
-    bloom_filter: BasicBloomFilter,
-    // TODO(t/1389): `offsets` is immutable; is there a better
-    // data structure for this workload?
-    offsets: Vec<(u64, Vec<u8>)>,
-    key_range: KeyRange,
-    blob_dropper: Arc<BlobDropper>,
-    /// size of the blob in bytes
-    blob_size: usize,
+impl<Ctx: Context> TombstoneIterator for SstScanner<Ctx> {
+    type Error = SstError;
 }
 
-impl<BC: StorageWrapper> SstReader<BC> {
-    pub(crate) fn new(
-        storage_wrapper: BC,
-        blob_id: &str,
-        compactor_tx: Sender<CompactorMessage>,
-    ) -> Result<SstReader<BC>, SstError> {
-        let blob_store = storage_wrapper.blob_store_ref();
-        let (metadata, blob_size) = MetadataBlock::from_blob(blob_store.clone(), blob_id)?;
+/// ThinSstMetadata is the same as SstReader, but without the Bloom filter
+/// data.
+#[derive(Clone, Debug)]
+pub(crate) struct ThinSstMetadata {
+    blob_id: String,
+    // TODO(t/1389): `offsets` is immutable; is there a better
+    // data structure for this workload?
+    offsets: Vec<(usize, Vec<u8>)>,
+    key_range: KeyRange,
+    /// size of the blob in bytes
+    blob_size: usize,
+    #[allow(dead_code)]
+    blob_dropper: Arc<BlobDropper>,
+}
 
-        let offsets = metadata.values_ref().clone();
-        let key_range = metadata.key_range_ref().clone();
-        let blob_id = blob_id.to_string();
-        let blob_dropper = Arc::new(BlobDropper::new(&blob_id, compactor_tx));
-        Ok(SstReader {
-            blob_id,
-            storage_wrapper,
-            bloom_filter: metadata.bloom_filter_ref().clone(),
-            offsets,
-            key_range,
-            blob_dropper,
-            blob_size,
-        })
-    }
-
+impl ThinSstMetadata {
     pub(crate) fn blob_id_ref(&self) -> &str {
         &self.blob_id
     }
 
-    pub(crate) fn key_range_ref(&self) -> &KeyRange {
-        &self.key_range
+    pub(crate) fn offsets_ref(&self) -> &Vec<(usize, Vec<u8>)> {
+        &self.offsets
     }
 
-    pub(crate) fn size(&self) -> usize {
+    pub(crate) fn blob_size(&self) -> usize {
         self.blob_size
     }
 }
 
-impl<BC: StorageWrapper> TombstonePointReader for SstReader<BC> {
-    type E = SstError;
+#[derive(Clone, Debug)]
+pub(crate) struct SstReader {
+    bloom_filter: BasicBloomFilter,
+    thin_metadata: ThinSstMetadata,
+}
 
-    fn get(&self, key: &[u8]) -> Result<Option<TombstoneValue>, SstError> {
-        if self.key_range.in_range(key) != KeyRangeCmp::InRange {
+impl SstReader {
+    pub(crate) fn new<B: BlobStore>(
+        blob_store: &B,
+        blob_id: &str,
+        compactor_tx: Sender<CompactorMessage>,
+    ) -> Result<SstReader, SstError> {
+        let (metadata, blob_size) = MetadataBlock::from_blob(blob_store, blob_id)?;
+
+        let offsets: Result<Vec<(usize, Vec<u8>)>, _> = metadata
+            .values_ref()
+            .iter()
+            .map(|(offset, key)| {
+                let offset = match usize::try_from(*offset) {
+                    Ok(offset) => offset,
+                    Err(err) => {
+                        return Err(SstError::Internal(format!(
+                            "could not convert offset to usize: {:?}",
+                            err
+                        )))
+                    }
+                };
+                Ok((offset, key.clone()))
+            })
+            .collect();
+        let offsets = offsets?;
+
+        let key_range = metadata.key_range_ref().clone();
+        let blob_id = blob_id.to_string();
+        let blob_dropper = Arc::new(BlobDropper::new(&blob_id, compactor_tx));
+        let meta = ThinSstMetadata {
+            blob_id,
+            offsets,
+            key_range,
+            blob_dropper,
+            blob_size,
+        };
+        let reader = SstReader {
+            bloom_filter: metadata.bloom_filter_ref().clone(),
+            thin_metadata: meta,
+        };
+        Ok(reader)
+    }
+
+    pub(crate) fn blob_id_ref(&self) -> &str {
+        &self.thin_metadata.blob_id
+    }
+
+    pub(crate) fn key_range_ref(&self) -> &KeyRange {
+        &self.thin_metadata.key_range
+    }
+
+    pub(crate) fn offsets_ref(&self) -> &Vec<(usize, Vec<u8>)> {
+        self.thin_metadata.offsets_ref()
+    }
+
+    pub(crate) fn blob_size(&self) -> usize {
+        self.thin_metadata.blob_size
+    }
+}
+
+impl TombstonePointReader for SstReader {
+    type Error = SstError;
+
+    fn get<Ctx: Context>(&self, ctx: &Ctx, key: &[u8]) -> Result<Option<TombstoneValue>, SstError> {
+        if self.key_range_ref().in_range(key) != KeyRangeCmp::InRange {
             // TODO(gs): Is this check needed?
             return Ok(None);
         }
         if !self.bloom_filter.contains(key) {
             return Ok(None);
         }
-        if self.offsets.is_empty() {
+        if self.offsets_ref().is_empty() {
             return Err(SstError::Internal("sst offsets are empty".to_string()));
         }
-        fn get_scanner<BC2: StorageWrapper>(
-            my_storage_wrapper: &BC2,
+
+        fn get_scanner<Ctx2: Context>(
+            my_ctx: &Ctx2,
+            meta: ThinSstMetadata,
             my_key: &[u8],
-            my_blob_id: &str,
-            my_offsets: &Vec<(u64, Vec<u8>)>,
-            blob_dropper: Arc<BlobDropper>,
-        ) -> Result<Option<SstScanner<BC2>>, SstError> {
-            assert!(!my_offsets.is_empty());
+        ) -> Result<Option<SstScanner<Ctx2>>, SstError> {
+            let offsets = meta.offsets_ref();
+            assert!(!offsets.is_empty());
 
             let key_vec = my_key.to_vec();
             let mut offset_idx = 0;
             loop {
-                if my_offsets[offset_idx].1.cmp(&key_vec) == Ordering::Greater {
+                if offsets[offset_idx].1.cmp(&key_vec) == Ordering::Greater {
                     if offset_idx == 0 {
                         return Ok(None);
                     }
@@ -391,29 +414,16 @@ impl<BC: StorageWrapper> TombstonePointReader for SstReader<BC> {
                     break;
                 }
                 offset_idx += 1;
-                if offset_idx == my_offsets.len() {
+                if offset_idx == offsets.len() {
                     offset_idx -= 1;
                     break;
                 }
             }
-            let offset = my_offsets[offset_idx].0;
-            let offset = try_usize(offset)?;
-            let scanner = SstScanner::new(
-                my_storage_wrapper.clone(),
-                my_blob_id,
-                None,
-                offset,
-                blob_dropper,
-            )?;
+            let offset = offsets[offset_idx].0;
+            let scanner = SstScanner::new(my_ctx.clone(), meta, None, offset)?;
             Ok(Some(scanner))
         }
-        let option = get_scanner(
-            &self.storage_wrapper,
-            key,
-            &self.blob_id,
-            &self.offsets,
-            self.blob_dropper.clone(),
-        )?;
+        let option = get_scanner(ctx, self.thin_metadata.clone(), key)?;
         let mut scanner = match option {
             Some(scanner) => scanner,
             None => {
@@ -437,7 +447,7 @@ impl<BC: StorageWrapper> TombstonePointReader for SstReader<BC> {
             } else {
                 return Ok(None);
             }
-            if cmp_key(pair.key_ref(), self.key_range.end_ref()) == Ordering::Equal {
+            if cmp_key(pair.key_ref(), self.key_range_ref().end_ref()) == Ordering::Equal {
                 break;
             }
         }
@@ -448,17 +458,17 @@ impl<BC: StorageWrapper> TombstonePointReader for SstReader<BC> {
     }
 }
 
-impl<BC: StorageWrapper> TryTombstoneScanner for SstReader<BC> {
-    type E = SstError;
-    type I = SstScanner<BC>;
+impl TryTombstoneScanner for SstReader {
+    type Error = SstError;
+    type Iter<Ctx> = SstScanner<Ctx>
+        where Ctx: Context;
 
-    fn try_scan(&self) -> Result<Self::I, Self::E> {
+    fn try_scan<Ctx: Context>(&self, ctx: &Ctx) -> Result<Self::Iter<Ctx>, Self::Error> {
         SstScanner::new(
-            self.storage_wrapper.clone(),
-            &self.blob_id,
-            Some(self.key_range.end_ref().to_vec()),
+            ctx.clone(),
+            self.thin_metadata.clone(),
+            Some(self.key_range_ref().end_ref().to_vec()),
             0,
-            self.blob_dropper.clone(),
         )
     }
 }

@@ -1,13 +1,15 @@
-use std::{cmp::Ordering, fmt::Debug};
+use std::async_iter::AsyncIterator;
+use std::cmp::Ordering;
+use std::fmt::Debug;
+use std::marker::PhantomData;
 
-use crate::{
-    common::{cmp_key, join_byte_arrays, try_u64},
-    var_int::VarInt64,
-};
+use crate::common::{cmp_key, join_byte_arrays, try_u64};
+use crate::context::Context;
+use crate::var_int::VarInt64;
 
 pub(crate) trait KeyValuePointReader {
-    type E;
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::E>;
+    type Error;
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -177,29 +179,52 @@ impl TryInto<Vec<u8>> for TombstonePair {
 }
 
 pub(crate) trait TombstonePointReader {
-    type E: Debug;
-    fn get(&self, key: &[u8]) -> Result<Option<TombstoneValue>, Self::E>;
+    type Error: Debug;
+    fn get<Ctx: Context>(
+        &self,
+        ctx: &Ctx,
+        key: &[u8],
+    ) -> Result<Option<TombstoneValue>, Self::Error>;
 }
 
-pub(crate) trait TombstoneIterator: Iterator<Item = Result<TombstonePair, Self::E>> {
-    type E;
-
+pub(crate) trait RangeSet {
     fn from(self, key: &[u8]) -> Self;
     fn to(self, key: &[u8]) -> Self;
 }
 
-pub(crate) trait TombstoneScanner {
-    type E;
-    type I: TombstoneIterator<E = Self::E>;
+pub(crate) trait TombstoneIterator:
+    RangeSet + Iterator<Item = Result<TombstonePair, Self::Error>>
+{
+    type Error;
+}
 
-    fn scan(&self) -> Self::I;
+pub(crate) trait AsyncTombstoneIterator:
+    RangeSet + AsyncIterator<Item = Result<TombstonePair, Self::Error>>
+{
+    type Error;
+}
+
+pub(crate) trait TombstoneScanner {
+    type Error;
+    type Iter: TombstoneIterator<Error = Self::Error>;
+
+    fn scan(&self) -> Self::Iter;
 }
 
 pub(crate) trait TryTombstoneScanner {
-    type E;
-    type I: TombstoneIterator<E = Self::E>;
+    type Error;
+    type Iter<Ctx>: TombstoneIterator<Error = Self::Error>
+    where
+        Ctx: Context;
 
-    fn try_scan(&self) -> Result<Self::I, Self::E>;
+    fn try_scan<Ctx: Context>(&self, ctx: &Ctx) -> Result<Self::Iter<Ctx>, Self::Error>;
+}
+
+pub(crate) trait TryAsyncTombstoneScanner {
+    type Error;
+    type Iter: AsyncTombstoneIterator<Error = Self::Error>;
+
+    fn try_async_scan(&self) -> Result<Self::Iter, Self::Error>;
 }
 
 pub(crate) trait TombstoneStore: TombstonePointReader + TombstoneScanner {
@@ -212,6 +237,7 @@ pub(crate) trait TombstoneStore: TombstonePointReader + TombstoneScanner {
     ) -> Result<(), <Self as TombstoneStore>::E>;
 }
 
+#[derive(Debug)]
 struct ScanRunner<I: TombstoneIterator> {
     iter: I,
     still_running: bool,
@@ -219,7 +245,7 @@ struct ScanRunner<I: TombstoneIterator> {
 }
 
 impl<I: TombstoneIterator> ScanRunner<I> {
-    fn step(&mut self) -> Result<(), I::E> {
+    fn step(&mut self) -> Result<(), I::Error> {
         if self.still_running {
             self.still_running = false;
             self.last_pair = None;
@@ -235,6 +261,7 @@ impl<I: TombstoneIterator> ScanRunner<I> {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct MergedHomogenousIter<I: TombstoneIterator> {
     started: bool,
     runners: Vec<ScanRunner<I>>,
@@ -259,7 +286,7 @@ impl<I: TombstoneIterator> MergedHomogenousIter<I> {
 }
 
 impl<I: TombstoneIterator> Iterator for MergedHomogenousIter<I> {
-    type Item = Result<TombstonePair, I::E>;
+    type Item = Result<TombstonePair, I::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // start the runners if not yet dequeued
@@ -313,9 +340,7 @@ impl<I: TombstoneIterator> Iterator for MergedHomogenousIter<I> {
     }
 }
 
-impl<I: TombstoneIterator> TombstoneIterator for MergedHomogenousIter<I> {
-    type E = I::E;
-
+impl<I: TombstoneIterator> RangeSet for MergedHomogenousIter<I> {
     fn from(self, key: &[u8]) -> Self {
         let mut runners = Vec::with_capacity(self.runners.len());
         for runner in self.runners {
@@ -347,14 +372,20 @@ impl<I: TombstoneIterator> TombstoneIterator for MergedHomogenousIter<I> {
     }
 }
 
+impl<I: TombstoneIterator> TombstoneIterator for MergedHomogenousIter<I> {
+    type Error = I::Error;
+}
+
 /// The first iterator's keys take precedence over the second iterator's keys.
-pub(crate) struct JoinedIter<E, A: TombstoneIterator<E = E>, B: TombstoneIterator<E = E>> {
+#[derive(Debug)]
+pub(crate) struct JoinedIter<E, A: TombstoneIterator, B: TombstoneIterator> {
     a: ScanRunner<A>,
     b: ScanRunner<B>,
     started: bool,
+    phantom: PhantomData<E>,
 }
 
-impl<E, A: TombstoneIterator<E = E>, B: TombstoneIterator<E = E>> JoinedIter<E, A, B> {
+impl<E, A: TombstoneIterator, B: TombstoneIterator> JoinedIter<E, A, B> {
     pub(crate) fn new(a: A, b: B) -> Self {
         JoinedIter {
             a: ScanRunner {
@@ -368,20 +399,24 @@ impl<E, A: TombstoneIterator<E = E>, B: TombstoneIterator<E = E>> JoinedIter<E, 
                 last_pair: None,
             },
             started: false,
+            phantom: PhantomData,
         }
     }
 }
 
-impl<E, A: TombstoneIterator<E = E>, B: TombstoneIterator<E = E>> Iterator for JoinedIter<E, A, B> {
+impl<E, A: TombstoneIterator, B: TombstoneIterator> Iterator for JoinedIter<E, A, B>
+where
+    E: From<<A as TombstoneIterator>::Error> + From<<B as TombstoneIterator>::Error>,
+{
     type Item = Result<TombstonePair, E>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.started {
             if let Err(err) = self.a.step() {
-                return Some(Err(err));
+                return Some(Err(E::from(err)));
             }
             if let Err(err) = self.b.step() {
-                return Some(Err(err));
+                return Some(Err(E::from(err)));
             }
             self.started = true;
         }
@@ -416,22 +451,19 @@ impl<E, A: TombstoneIterator<E = E>, B: TombstoneIterator<E = E>> Iterator for J
         }
         if step_a {
             if let Err(err) = self.a.step() {
-                return Some(Err(err));
+                return Some(Err(E::from(err)));
             }
         }
         if step_b {
             if let Err(err) = self.b.step() {
-                return Some(Err(err));
+                return Some(Err(E::from(err)));
             }
         }
         next_pair.map(Ok)
     }
 }
-impl<E, A: TombstoneIterator<E = E>, B: TombstoneIterator<E = E>> TombstoneIterator
-    for JoinedIter<E, A, B>
-{
-    type E = E;
 
+impl<E, A: TombstoneIterator, B: TombstoneIterator> RangeSet for JoinedIter<E, A, B> {
     fn from(self, key: &[u8]) -> Self {
         let runner_a = ScanRunner {
             iter: self.a.iter.from(key),
@@ -447,6 +479,7 @@ impl<E, A: TombstoneIterator<E = E>, B: TombstoneIterator<E = E>> TombstoneItera
             a: runner_a,
             b: runner_b,
             started: self.started,
+            phantom: PhantomData,
         }
     }
 
@@ -465,8 +498,16 @@ impl<E, A: TombstoneIterator<E = E>, B: TombstoneIterator<E = E>> TombstoneItera
             a: runner_a,
             b: runner_b,
             started: self.started,
+            phantom: PhantomData,
         }
     }
+}
+
+impl<E, A: TombstoneIterator, B: TombstoneIterator> TombstoneIterator for JoinedIter<E, A, B>
+where
+    E: From<<A as TombstoneIterator>::Error> + From<<B as TombstoneIterator>::Error>,
+{
+    type Error = E;
 }
 
 #[cfg(test)]
@@ -474,7 +515,10 @@ mod test {
     use std::cmp::Ordering;
 
     use super::*;
-    use crate::common::cmp_key;
+    use crate::{
+        common::cmp_key,
+        concurrent_skip_list::{ConcurrentSkipList, ConcurrentSkipListScanner},
+    };
 
     fn some_key() -> Vec<u8> {
         vec![0, 2, 3]
@@ -520,5 +564,138 @@ mod test {
             cmp_key(pair.value_ref().as_ref().unwrap(), &some_val()),
             Ordering::Equal
         );
+    }
+
+    struct SkipListPairIter {
+        inner: ConcurrentSkipListScanner<Vec<u8>, Option<Vec<u8>>>,
+    }
+
+    impl Iterator for SkipListPairIter {
+        type Item = Result<TombstonePair, ()>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let view = self.inner.next()?;
+            let key = view.key_ref().to_vec();
+            if let Some(value) = view.value_ref().as_ref() {
+                return Some(Ok(TombstonePair::new(key, value.clone())));
+            }
+            Some(Ok(TombstonePair::deletion_marker(key)))
+        }
+    }
+
+    impl RangeSet for SkipListPairIter {
+        fn from(self, _key: &[u8]) -> Self {
+            unimplemented!()
+        }
+
+        fn to(self, _key: &[u8]) -> Self {
+            unimplemented!()
+        }
+    }
+
+    impl TombstoneIterator for SkipListPairIter {
+        type Error = ();
+    }
+
+    #[test]
+    fn test_joined_iter() {
+        // TODO(t/1388): This number should be bigger.
+        let top = 5 * 10_000_usize;
+
+        // create the skip lists
+        let mut skip_list_a: ConcurrentSkipList<Vec<u8>, Option<Vec<u8>>> =
+            ConcurrentSkipList::new();
+        let mut skip_list_b: ConcurrentSkipList<Vec<u8>, Option<Vec<u8>>> =
+            ConcurrentSkipList::new();
+
+        // set initial values
+        let val = Some(vec![1]);
+        for i in 0..(4 * top) {
+            let idx = i as u64;
+            let key = idx.to_be_bytes();
+            skip_list_a.set(key, val.clone());
+            skip_list_b.set(key, val.clone());
+        }
+
+        // construct joined iterator
+        let scanner_a = skip_list_a.iter();
+        let scanner_b = skip_list_b.iter();
+        let mut joined_iter: JoinedIter<(), SkipListPairIter, SkipListPairIter> = JoinedIter::new(
+            SkipListPairIter { inner: scanner_a },
+            SkipListPairIter { inner: scanner_b },
+        );
+
+        // interleave writing writers and scanning
+        let mini = top / 5 - 1;
+        let do_nothing = 0;
+        let to_remove = 1;
+        let to_set = 2;
+        for i in 0..mini {
+            let idx = (i * 5) as u64;
+
+            let a_action = i % 3;
+            let b_action = (i / 3) % 3;
+            let programs = [(&mut skip_list_a, a_action), (&mut skip_list_b, b_action)];
+
+            // set i to 2, i+1 to 0, i+2 to 3, leave i+3 as 1, and delete / reset i+4
+            for (skip_list_ref, action) in programs {
+                skip_list_ref.set(idx.to_be_bytes(), vec![2]);
+                skip_list_ref.set((idx + 1).to_be_bytes(), vec![0]);
+                skip_list_ref.set((idx + 2).to_be_bytes(), vec![3]);
+                if action == to_remove {
+                    skip_list_ref.remove(&(idx + 4).to_be_bytes().to_vec());
+                    continue;
+                }
+                if action == to_set {
+                    skip_list_ref.set((idx + 4).to_be_bytes(), None);
+                    continue;
+                }
+                assert_eq!(action, do_nothing);
+            }
+
+            // scan over the new values
+            {
+                // The scanner pre-loads one read ahead, so a mutation that
+                // affects the next value may not be updated.
+                //
+                // However, ideally it should be able to read up-to-date
+                // values. For now, the documentation should say users should
+                // expect reads to the next value may or may not be updated
+                // so that it can be changed later.
+                let view = joined_iter.next().unwrap().unwrap();
+                assert_eq!(view.key_ref().to_vec(), idx.to_be_bytes());
+                let value = view.value_ref().as_ref().unwrap().to_vec();
+                assert_eq!(value.len(), 1);
+                assert!(value[0] == 1 || value[0] == 2);
+            }
+            let view = joined_iter.next().unwrap().unwrap();
+            assert_eq!(view.key_ref().to_vec(), (idx + 1).to_be_bytes());
+            assert_eq!(view.value_ref().as_ref().unwrap().to_vec(), vec![0]);
+            let view = joined_iter.next().unwrap().unwrap();
+            assert_eq!(view.key_ref().to_vec(), (idx + 2).to_be_bytes());
+            assert_eq!(view.value_ref().as_ref().unwrap().to_vec(), vec![3]);
+            let view = joined_iter.next().unwrap().unwrap();
+            assert_eq!(view.key_ref().to_vec(), (idx + 3).to_be_bytes());
+            assert_eq!(view.value_ref().as_ref().unwrap().to_vec(), vec![1]);
+            if a_action != to_remove || b_action != to_remove {
+                let expected = if a_action == do_nothing {
+                    Some(vec![1])
+                } else if a_action == to_set {
+                    None
+                } else if b_action == do_nothing {
+                    assert_eq!(a_action, to_remove);
+                    Some(vec![1])
+                } else {
+                    assert_eq!(a_action, to_remove);
+                    assert_eq!(b_action, to_set);
+                    None
+                };
+
+                let pair = joined_iter.next().unwrap().unwrap();
+                let found = pair.value_ref().as_ref().cloned();
+                assert_eq!(pair.key_ref().to_vec(), (idx + 4).to_be_bytes());
+                assert_eq!(found, expected);
+            }
+        }
     }
 }

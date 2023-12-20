@@ -2,7 +2,7 @@ use std::string::FromUtf8Error;
 
 use crate::checksum::crc32;
 use crate::common::{try_length_prefix, CastError};
-use crate::storage::blob_store::{FileError, ReadCursor, WriteCursor};
+use crate::storage::blob_store::{BlobStoreError, ReadCursor, WriteCursor};
 use crate::var_int::VarInt64;
 
 #[derive(Clone, Debug)]
@@ -12,7 +12,7 @@ pub(crate) enum WalError {
     InvalidInput(Option<String>),
     RecoveryError(String),
     RotationRequired,
-    Closed,
+    FinalizedWal,
 }
 
 impl From<CastError> for WalError {
@@ -27,8 +27,8 @@ impl From<FromUtf8Error> for WalError {
     }
 }
 
-impl From<FileError> for WalError {
-    fn from(value: FileError) -> Self {
+impl From<BlobStoreError> for WalError {
+    fn from(value: BlobStoreError) -> Self {
         WalError::BlobStoreError(format!("{:?}", value))
     }
 }
