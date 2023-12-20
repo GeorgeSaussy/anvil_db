@@ -1,11 +1,15 @@
 #[cfg(test)]
 mod test {
     use crate::anvil_db::{AnvilDb, AnvilDbConfig};
+    use crate::context::SimpleContext;
+    use crate::helpful_macros::unwrap;
     use crate::logging::{debug, DefaultLogger};
-    use crate::sst::block_cache::{NoBlockCache, SimpleStorageWrapper};
+    use crate::sst::block_cache::cache::LruBlockCache;
     use crate::storage::blob_store::InMemoryBlobStore;
-    use crate::tablet::SmartTablet;
     use crate::var_int::VarInt64;
+
+    type TestOnlyContext = SimpleContext<InMemoryBlobStore, LruBlockCache, DefaultLogger>;
+    type TestOnlyAnvilDb = AnvilDb<TestOnlyContext>;
 
     #[test]
     fn test_tiny_recovery() {
@@ -14,11 +18,6 @@ mod test {
         debug!("OPEN A NEW DB");
         let store = InMemoryBlobStore::new();
 
-        // TODO(t/1387): This should use the real block cache when it
-        // is implemented.
-        type TestOnlyStorageWrapper = SimpleStorageWrapper<InMemoryBlobStore, NoBlockCache>;
-        type TestOnlyAnvilDb =
-            AnvilDb<TestOnlyStorageWrapper, SmartTablet<TestOnlyStorageWrapper>, DefaultLogger>;
         let jdb: TestOnlyAnvilDb = AnvilDb::new(store.clone()).unwrap();
 
         debug!("CREATE SOME DATA");
@@ -76,11 +75,6 @@ mod test {
         debug!("OPEN A NEW DB");
         let store = InMemoryBlobStore::new();
 
-        // TODO(t/1387): This should use the real block cache when it
-        // is implemented.
-        type TestOnlyStorageWrapper = SimpleStorageWrapper<InMemoryBlobStore, NoBlockCache>;
-        type TestOnlyAnvilDb =
-            AnvilDb<TestOnlyStorageWrapper, SmartTablet<TestOnlyStorageWrapper>, DefaultLogger>;
         let jdb: TestOnlyAnvilDb = AnvilDb::new(store.clone()).unwrap();
 
         debug!("CREATE SOME DATA");
@@ -139,7 +133,7 @@ mod test {
             }
             let key = &keys[k];
             let val = &values_1[k];
-            let found = jdb.get(key.data_ref()).unwrap().unwrap();
+            let found = unwrap!(unwrap!(jdb.get(key.data_ref())));
             assert_eq!(found, val.data_ref().to_vec(), "k: {}", k);
         }
 

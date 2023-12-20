@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 // TODO(t/1239): Add links within the documentation.
 
 #[derive(Debug)]
-pub(crate) enum FileError {
+pub(crate) enum BlobStoreError {
     NotImplemented,
     AlreadyExists,
     InternalError,
@@ -23,14 +23,14 @@ pub(crate) enum FileError {
     InvalidInput(String),
 }
 
-impl FileError {
-    pub(crate) fn wrap_read_error(err: std::io::Error) -> FileError {
-        FileError::ReadError(Some(format!("underlying storage error: {:?}", err)))
+impl BlobStoreError {
+    pub(crate) fn wrap_read_error(err: std::io::Error) -> BlobStoreError {
+        BlobStoreError::ReadError(Some(format!("underlying storage error: {:?}", err)))
     }
 }
 
-impl From<FileError> for String {
-    fn from(value: FileError) -> Self {
+impl From<BlobStoreError> for String {
+    fn from(value: BlobStoreError) -> Self {
         format!("FileError: {:?}", value)
     }
 }
@@ -46,25 +46,25 @@ pub(crate) struct InMemoryIdIndex {
 }
 
 impl InMemoryIdIndex {
-    fn get_ref(&self, name: &str) -> Result<FileRef, FileError> {
+    fn get_ref(&self, name: &str) -> Result<FileRef, BlobStoreError> {
         if let Some(my_ref) = self.name_to_ref.get(name) {
             Ok(*my_ref)
         } else {
-            Err(FileError::NotImplemented)
+            Err(BlobStoreError::NotImplemented)
         }
     }
 
     // creates an unnamed file
-    fn add_ref(&mut self, _my_ref: FileRef) -> Result<(), FileError> {
+    fn add_ref(&mut self, _my_ref: FileRef) -> Result<(), BlobStoreError> {
         self.ref_to_name.insert(_my_ref, String::from(""));
         Ok(())
     }
 
-    fn list_refs(&self) -> Result<Vec<FileRef>, FileError> {
+    fn list_refs(&self) -> Result<Vec<FileRef>, BlobStoreError> {
         Ok(self.ref_to_name.keys().copied().collect())
     }
 
-    fn add_name(&mut self, _name: &str) -> Result<FileRef, FileError> {
+    fn add_name(&mut self, _name: &str) -> Result<FileRef, BlobStoreError> {
         let max_tries = 100;
         for _ in 0..max_tries {
             self.highest_ref += 1;
@@ -77,20 +77,20 @@ impl InMemoryIdIndex {
                 .insert(String::from(_name), self.highest_ref);
             return Ok(self.highest_ref);
         }
-        Err(FileError::InternalError)
+        Err(BlobStoreError::InternalError)
     }
 
-    fn delete_name(&mut self, name: &str) -> Result<(), FileError> {
+    fn delete_name(&mut self, name: &str) -> Result<(), BlobStoreError> {
         if let Some(my_ref) = self.name_to_ref.get(name) {
             self.ref_to_name.remove(my_ref);
             self.name_to_ref.remove(name);
             Ok(())
         } else {
-            Err(FileError::NotFound)
+            Err(BlobStoreError::NotFound)
         }
     }
 
-    fn rename(&mut self, old_name: &str, new_name: &str) -> Result<(), FileError> {
+    fn rename(&mut self, old_name: &str, new_name: &str) -> Result<(), BlobStoreError> {
         let option = self.name_to_ref.get(old_name);
         match option {
             Some(rr) => {
@@ -99,26 +99,26 @@ impl InMemoryIdIndex {
                 self.name_to_ref.remove(old_name);
                 self.name_to_ref.insert(String::from(new_name), my_ref);
             }
-            None => return Err(FileError::NotFound),
+            None => return Err(BlobStoreError::NotFound),
         }
         Ok(())
     }
 }
 
 pub(crate) trait ReadCursor {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, FileError>;
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), FileError>;
-    fn offset_read(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize, FileError>;
-    fn skip(&mut self, offset: usize) -> Result<(), FileError>;
-    fn seek_from_end(&mut self, offset: usize) -> Result<(), FileError>;
-    fn size(&self) -> Result<usize, FileError>;
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, BlobStoreError>;
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), BlobStoreError>;
+    fn offset_read(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize, BlobStoreError>;
+    fn skip(&mut self, offset: usize) -> Result<(), BlobStoreError>;
+    fn seek_from_end(&mut self, offset: usize) -> Result<(), BlobStoreError>;
+    fn size(&self) -> Result<usize, BlobStoreError>;
 }
 
 pub(crate) trait WriteCursor {
     /// The write cursor can only append to the end of the file.
     /// It fill fail if the file has already been finalized.
-    fn write(&mut self, buf: &[u8]) -> Result<(), FileError>;
-    fn finalize(self) -> Result<(), FileError>;
+    fn write(&mut self, buf: &[u8]) -> Result<(), BlobStoreError>;
+    fn finalize(self) -> Result<(), BlobStoreError>;
 }
 
 /// BlobStore is a trait that allows for the creation, deletion, and reading of
@@ -126,17 +126,17 @@ pub(crate) trait WriteCursor {
 /// a valid file path.
 /// Implementations of BlobStore must be thread safe.
 pub(crate) trait BlobStore: Clone + Send + Sync + 'static {
-    type RC: ReadCursor;
-    type WC: WriteCursor;
-    type BI: Iterator<Item = String>;
+    type ReadCursor: ReadCursor;
+    type WriteCursor: WriteCursor;
+    type BlobIter: Iterator<Item = String>;
 
-    fn exists(&self, blob_id: &str) -> Result<bool, FileError>;
-    fn read_cursor(&self, blob_id: &str) -> Result<Self::RC, FileError>;
+    fn exists(&self, blob_id: &str) -> Result<bool, BlobStoreError>;
+    fn read_cursor(&self, blob_id: &str) -> Result<Self::ReadCursor, BlobStoreError>;
     /// Create a new blob with the given name. If the blob already
     /// exists, the function will return an error.
-    fn create_blob(&self, blob_id: &str) -> Result<Self::WC, FileError>;
-    fn blob_iter(&self) -> Result<Self::BI, FileError>;
-    fn delete(&self, blob_id: &str) -> Result<(), FileError>;
+    fn create_blob(&self, blob_id: &str) -> Result<Self::WriteCursor, BlobStoreError>;
+    fn blob_iter(&self) -> Result<Self::BlobIter, BlobStoreError>;
+    fn delete(&self, blob_id: &str) -> Result<(), BlobStoreError>;
 }
 struct InMemoryBlobData {
     blobs: HashMap<String, Vec<u8>>,
@@ -157,7 +157,7 @@ pub(crate) struct InMemoryReadCursor {
 }
 
 impl ReadCursor for InMemoryReadCursor {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, FileError> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, BlobStoreError> {
         let file_store = self.blob_store.lock().unwrap();
         let file = file_store.blobs.get(&self.blob_name).unwrap();
         let mut i = 0;
@@ -169,20 +169,20 @@ impl ReadCursor for InMemoryReadCursor {
         Ok(i)
     }
 
-    fn offset_read(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize, FileError> {
+    fn offset_read(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize, BlobStoreError> {
         self.offset = offset;
         self.read(buf)
     }
 
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), FileError> {
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), BlobStoreError> {
         let blob_store = self.blob_store.lock().unwrap();
         let blob = if let Some(blob) = blob_store.blobs.get(&self.blob_name) {
             blob
         } else {
-            return Err(FileError::NotFound);
+            return Err(BlobStoreError::NotFound);
         };
         if self.offset + buf.len() > blob.len() {
-            return Err(FileError::ReadError(Some(format!(
+            return Err(BlobStoreError::ReadError(Some(format!(
                 "read_exact: offset {} + buf.len() {} = {} > blob.len() {}",
                 self.offset,
                 buf.len(),
@@ -197,22 +197,22 @@ impl ReadCursor for InMemoryReadCursor {
         Ok(())
     }
 
-    fn skip(&mut self, offset: usize) -> Result<(), FileError> {
+    fn skip(&mut self, offset: usize) -> Result<(), BlobStoreError> {
         let blob_store = self.blob_store.lock().unwrap();
         let blob = blob_store.blobs.get(&self.blob_name).unwrap();
         if self.offset + offset > blob.len() {
-            return Err(FileError::ReadError(None));
+            return Err(BlobStoreError::ReadError(None));
         }
         self.offset += offset;
         Ok(())
     }
 
-    fn seek_from_end(&mut self, offset: usize) -> Result<(), FileError> {
+    fn seek_from_end(&mut self, offset: usize) -> Result<(), BlobStoreError> {
         let blob_store = self.blob_store.lock().unwrap();
         let blob = blob_store.blobs.get(&self.blob_name).unwrap();
         let blob_len = blob.len();
         if offset > blob_len {
-            return Err(FileError::ReadError(Some(format!(
+            return Err(BlobStoreError::ReadError(Some(format!(
                 "offset {:?} is greater than blob length {}",
                 offset, blob_len
             ))));
@@ -221,12 +221,12 @@ impl ReadCursor for InMemoryReadCursor {
         Ok(())
     }
 
-    fn size(&self) -> Result<usize, FileError> {
+    fn size(&self) -> Result<usize, BlobStoreError> {
         let blob_store = self.blob_store.lock().unwrap();
         if let Some(blob) = blob_store.blobs.get(&self.blob_name) {
             return Ok(blob.len());
         }
-        Err(FileError::NotFound)
+        Err(BlobStoreError::NotFound)
     }
 }
 
@@ -236,14 +236,14 @@ pub(crate) struct InMemoryWriteCursor {
 }
 
 impl WriteCursor for InMemoryWriteCursor {
-    fn write(&mut self, buf: &[u8]) -> Result<(), FileError> {
+    fn write(&mut self, buf: &[u8]) -> Result<(), BlobStoreError> {
         let mut file_store = self.blob_store.lock().unwrap();
         let file = file_store.blobs.get_mut(&self.blob_name).unwrap();
         file.extend_from_slice(buf);
         Ok(())
     }
 
-    fn finalize(self) -> Result<(), FileError> {
+    fn finalize(self) -> Result<(), BlobStoreError> {
         Ok(())
     }
 }
@@ -268,16 +268,16 @@ impl Default for InMemoryBlobStore {
 }
 
 impl BlobStore for InMemoryBlobStore {
-    type BI = Box<dyn Iterator<Item = String>>;
-    type RC = InMemoryReadCursor;
-    type WC = InMemoryWriteCursor;
+    type BlobIter = Box<dyn Iterator<Item = String>>;
+    type ReadCursor = InMemoryReadCursor;
+    type WriteCursor = InMemoryWriteCursor;
 
-    fn exists(&self, blob_name: &str) -> Result<bool, FileError> {
+    fn exists(&self, blob_name: &str) -> Result<bool, BlobStoreError> {
         let blob_store = self.raw_data.lock().unwrap();
         Ok(blob_store.blobs.contains_key(blob_name))
     }
 
-    fn read_cursor(&self, blob_name: &str) -> Result<Self::RC, FileError> {
+    fn read_cursor(&self, blob_name: &str) -> Result<Self::ReadCursor, BlobStoreError> {
         Ok(InMemoryReadCursor {
             blob_name: blob_name.to_string(),
             offset: 0,
@@ -285,10 +285,10 @@ impl BlobStore for InMemoryBlobStore {
         })
     }
 
-    fn create_blob(&self, blob_name: &str) -> Result<Self::WC, FileError> {
+    fn create_blob(&self, blob_name: &str) -> Result<Self::WriteCursor, BlobStoreError> {
         let mut blob_store = self.raw_data.lock().unwrap();
         if blob_store.blobs.contains_key(blob_name) {
-            return Err(FileError::AlreadyExists);
+            return Err(BlobStoreError::AlreadyExists);
         }
         blob_store.blobs.insert(blob_name.to_string(), Vec::new());
         Ok(InMemoryWriteCursor {
@@ -297,15 +297,15 @@ impl BlobStore for InMemoryBlobStore {
         })
     }
 
-    fn delete(&self, blob_name: &str) -> Result<(), FileError> {
+    fn delete(&self, blob_name: &str) -> Result<(), BlobStoreError> {
         let mut blob_store = self.raw_data.lock().unwrap();
         match blob_store.blobs.remove(blob_name) {
             Some(_) => Ok(()),
-            None => Err(FileError::NotFound),
+            None => Err(BlobStoreError::NotFound),
         }
     }
 
-    fn blob_iter(&self) -> Result<Self::BI, FileError> {
+    fn blob_iter(&self) -> Result<Self::BlobIter, BlobStoreError> {
         let blob_store = self.raw_data.lock().unwrap();
         let blob_names: Vec<_> = blob_store.blobs.keys().map(|k| k.to_string()).collect();
         Ok(Box::new(blob_names.into_iter()))
@@ -323,35 +323,35 @@ impl LocalReadCursor {
 }
 
 impl ReadCursor for LocalReadCursor {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, FileError> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, BlobStoreError> {
         match self.file.read(buf) {
             Ok(n) => Ok(n),
-            Err(err) => Err(FileError::wrap_read_error(err)),
+            Err(err) => Err(BlobStoreError::wrap_read_error(err)),
         }
     }
 
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), FileError> {
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), BlobStoreError> {
         if let Err(err) = self.file.read_exact(buf) {
-            return Err(FileError::wrap_read_error(err));
+            return Err(BlobStoreError::wrap_read_error(err));
         }
         Ok(())
     }
 
-    fn offset_read(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize, FileError> {
+    fn offset_read(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize, BlobStoreError> {
         if let Err(err) = self.file.seek(SeekFrom::Start(offset as u64)) {
-            return Err(FileError::wrap_read_error(err));
+            return Err(BlobStoreError::wrap_read_error(err));
         }
         match self.file.read(buf) {
             Ok(n) => Ok(n),
-            Err(err) => Err(FileError::wrap_read_error(err)),
+            Err(err) => Err(BlobStoreError::wrap_read_error(err)),
         }
     }
 
-    fn skip(&mut self, offset: usize) -> Result<(), FileError> {
+    fn skip(&mut self, offset: usize) -> Result<(), BlobStoreError> {
         let offset: i64 = match offset.try_into() {
             Ok(n) => n,
             Err(_) => {
-                return Err(FileError::ReadError(Some(format!(
+                return Err(BlobStoreError::ReadError(Some(format!(
                     "offset {} cannot be converted to i64",
                     offset
                 ))));
@@ -359,15 +359,15 @@ impl ReadCursor for LocalReadCursor {
         };
         match self.file.seek(SeekFrom::Current(offset)) {
             Ok(_) => Ok(()),
-            Err(err) => Err(FileError::wrap_read_error(err)),
+            Err(err) => Err(BlobStoreError::wrap_read_error(err)),
         }
     }
 
-    fn seek_from_end(&mut self, offset: usize) -> Result<(), FileError> {
+    fn seek_from_end(&mut self, offset: usize) -> Result<(), BlobStoreError> {
         let offset: i64 = match offset.try_into() {
             Ok(n) => n,
             Err(_) => {
-                return Err(FileError::ReadError(Some(format!(
+                return Err(BlobStoreError::ReadError(Some(format!(
                     "offset {} cannot be converted to i64",
                     offset
                 ))));
@@ -375,15 +375,15 @@ impl ReadCursor for LocalReadCursor {
         };
         match self.file.seek(SeekFrom::End(-offset)) {
             Ok(_) => Ok(()),
-            Err(err) => Err(FileError::wrap_read_error(err)),
+            Err(err) => Err(BlobStoreError::wrap_read_error(err)),
         }
     }
 
-    fn size(&self) -> Result<usize, FileError> {
+    fn size(&self) -> Result<usize, BlobStoreError> {
         let metadata = match self.file.metadata() {
             Ok(m) => m,
             Err(err) => {
-                return Err(FileError::ReadError(Some(format!(
+                return Err(BlobStoreError::ReadError(Some(format!(
                     "could not get metadata: {:?}",
                     err
                 ))));
@@ -404,17 +404,17 @@ impl LocalWriteCursor {
 }
 
 impl WriteCursor for LocalWriteCursor {
-    fn write(&mut self, buf: &[u8]) -> Result<(), FileError> {
+    fn write(&mut self, buf: &[u8]) -> Result<(), BlobStoreError> {
         match self.file.write(buf) {
             Ok(_) => Ok(()),
-            Err(e) => Err(FileError::WriteError(e)),
+            Err(e) => Err(BlobStoreError::WriteError(e)),
         }
     }
 
-    fn finalize(self) -> Result<(), FileError> {
+    fn finalize(self) -> Result<(), BlobStoreError> {
         match self.file.sync_all() {
             Ok(_) => Ok(()),
-            Err(err) => Err(FileError::WriteError(err)),
+            Err(err) => Err(BlobStoreError::WriteError(err)),
         }
     }
 }
@@ -425,20 +425,20 @@ pub(crate) struct LocalBlobStore {
 }
 
 impl LocalBlobStore {
-    pub(crate) fn new(working_path: &str) -> Result<Self, FileError> {
+    pub(crate) fn new(working_path: &str) -> Result<Self, BlobStoreError> {
         let dir = PathBuf::from(working_path);
         if let Err(err) = create_dir_all(&dir) {
-            return Err(FileError::CreateDirError(err));
+            return Err(BlobStoreError::CreateDirError(err));
         }
         let working_directory = match canonicalize(&dir) {
             Ok(path) => {
                 if let Some(s) = path.to_str() {
                     s.to_string()
                 } else {
-                    return Err(FileError::UnknownError);
+                    return Err(BlobStoreError::UnknownError);
                 }
             }
-            Err(err) => return Err(FileError::CreateDirError(err)),
+            Err(err) => return Err(BlobStoreError::CreateDirError(err)),
         };
         Ok(LocalBlobStore { working_directory })
     }
@@ -448,16 +448,16 @@ impl LocalBlobStore {
     // It will match any name that includes only alphanumeric characters,
     // underscores, hyphens, and periods. The name cannot start with a
     // period.
-    fn get_file_path(&self, blob_name: &str) -> Result<PathBuf, FileError> {
+    fn get_file_path(&self, blob_name: &str) -> Result<PathBuf, BlobStoreError> {
         for (i, c) in blob_name.chars().enumerate() {
             if i == 0 && c == '.' {
-                return Err(FileError::InvalidInput(format!(
+                return Err(BlobStoreError::InvalidInput(format!(
                     "blob name cannot start with a period: {}",
                     blob_name
                 )));
             }
             if (!c.is_alphanumeric()) && c != '.' && c != '-' && c != '_' {
-                return Err(FileError::InvalidInput(format!(
+                return Err(BlobStoreError::InvalidInput(format!(
                     "blob name can only consist of alphanumeric characters or underscores, \
                      hyphens, or periods: offending_char={} index={} blob_name={}",
                     c, i, blob_name
@@ -471,46 +471,46 @@ impl LocalBlobStore {
 }
 
 impl BlobStore for LocalBlobStore {
-    type BI = Box<dyn Iterator<Item = String>>;
-    type RC = LocalReadCursor;
-    type WC = LocalWriteCursor;
+    type BlobIter = Box<dyn Iterator<Item = String>>;
+    type ReadCursor = LocalReadCursor;
+    type WriteCursor = LocalWriteCursor;
 
-    fn exists(&self, blob_id: &str) -> Result<bool, FileError> {
+    fn exists(&self, blob_id: &str) -> Result<bool, BlobStoreError> {
         let file_path = self.get_file_path(blob_id)?;
         Ok(file_path.exists())
     }
 
-    fn read_cursor(&self, blob_id: &str) -> Result<Self::RC, FileError> {
+    fn read_cursor(&self, blob_id: &str) -> Result<Self::ReadCursor, BlobStoreError> {
         let file_path = self.get_file_path(blob_id)?;
         let file = match File::open(file_path) {
             Ok(f) => f,
-            Err(err) => return Err(FileError::wrap_read_error(err)),
+            Err(err) => return Err(BlobStoreError::wrap_read_error(err)),
         };
         Ok(LocalReadCursor::new(file))
     }
 
-    fn create_blob(&self, blob_id: &str) -> Result<Self::WC, FileError> {
+    fn create_blob(&self, blob_id: &str) -> Result<Self::WriteCursor, BlobStoreError> {
         let file_path = self.get_file_path(blob_id)?;
         let file = match File::create(file_path) {
             Ok(f) => f,
-            Err(err) => return Err(FileError::WriteError(err)),
+            Err(err) => return Err(BlobStoreError::WriteError(err)),
         };
         Ok(LocalWriteCursor::new(file))
     }
 
-    fn delete(&self, blob_id: &str) -> Result<(), FileError> {
+    fn delete(&self, blob_id: &str) -> Result<(), BlobStoreError> {
         let file_path = self.get_file_path(blob_id)?;
         match remove_file(file_path) {
             Ok(_) => Ok(()),
-            Err(err) => Err(FileError::DeleteError(err)),
+            Err(err) => Err(BlobStoreError::DeleteError(err)),
         }
     }
 
-    fn blob_iter(&self) -> Result<Self::BI, FileError> {
+    fn blob_iter(&self) -> Result<Self::BlobIter, BlobStoreError> {
         let dir = match read_dir(&self.working_directory) {
             Ok(dir) => dir,
             Err(err) => {
-                return Err(FileError::wrap_read_error(err));
+                return Err(BlobStoreError::wrap_read_error(err));
             }
         };
         let mut ret = Vec::with_capacity(8);
@@ -520,12 +520,12 @@ impl BlobStore for LocalBlobStore {
                     let file_name = if let Some(name) = dir_entry.file_name().to_str() {
                         name.to_string()
                     } else {
-                        return Err(FileError::UnknownError);
+                        return Err(BlobStoreError::UnknownError);
                     };
                     ret.push(file_name);
                 }
                 Err(err) => {
-                    return Err(FileError::wrap_read_error(err));
+                    return Err(BlobStoreError::wrap_read_error(err));
                 }
             }
         }

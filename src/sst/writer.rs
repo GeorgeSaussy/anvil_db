@@ -11,7 +11,7 @@ use crate::sst::common::SstError;
 use crate::sst::metadata::MetadataBlock;
 use crate::sst::metadata::SstMetadata;
 use crate::storage::blob_store::BlobStore;
-use crate::storage::blob_store::FileError;
+use crate::storage::blob_store::BlobStoreError;
 use crate::storage::blob_store::WriteCursor;
 use crate::var_int::VarInt64;
 
@@ -20,9 +20,9 @@ type BlobId = String;
 #[derive(Clone, Debug)]
 pub(crate) struct SstWriteSettings {
     /// block_size is the size of the block in bytes
-    block_size: u64,
+    target_block_size_bytes: usize,
     /// block_length is the size of the block in number of pairs
-    block_length: u64,
+    target_keys_per_block: usize,
     /// whether to keep tombstones
     keep_tombstones: bool,
     /// the target SST size in bytes
@@ -43,8 +43,8 @@ impl SstWriteSettings {
     }
 
     fn scale(mut self, blob_up_factor: usize) -> Self {
-        self.block_size *= blob_up_factor as u64;
-        self.block_length *= blob_up_factor as u64;
+        self.target_block_size_bytes *= blob_up_factor;
+        self.target_keys_per_block *= blob_up_factor;
         self.target_sst_size *= blob_up_factor;
         self
     }
@@ -63,6 +63,16 @@ impl SstWriteSettings {
         }
         self
     }
+
+    pub(crate) fn with_target_block_size(mut self, target_block_size: usize) -> Self {
+        self.target_block_size_bytes = target_block_size;
+        self
+    }
+
+    pub(crate) fn with_target_keys_per_block(mut self, target_keys_per_block: usize) -> Self {
+        self.target_keys_per_block = target_keys_per_block;
+        self
+    }
 }
 
 const BASE_SST_SIZE: usize = 8 * 1_024 * 1_024;
@@ -70,9 +80,9 @@ const BASE_SST_SIZE: usize = 8 * 1_024 * 1_024;
 impl Default for SstWriteSettings {
     fn default() -> Self {
         SstWriteSettings {
-            block_size: 16 * 1024 * 1024, // 16 MB
-            block_length: 512 * 1024,     /* only hit if average record size
-                                           * < 32 bytes */
+            target_block_size_bytes: 16 * 1024 * 1024, // 16 MB
+            target_keys_per_block: 512 * 1024,         /* only hit if average record size
+                                                        * < 32 bytes */
             keep_tombstones: true,
             target_sst_size: BASE_SST_SIZE,
             writing_minor_sst: false,
@@ -88,7 +98,7 @@ struct BlockBuilder {
     previous_key: Vec<u8>,
     last_common_len: usize,
     key_count: u64,
-    bytes_written: u64,
+    bytes_written: usize,
 }
 
 /// This is for data blocks only.
@@ -108,7 +118,7 @@ impl BlockBuilder {
         writer: &mut WC,
         buf: &[u8],
     ) -> Result<usize, SstError> {
-        self.bytes_written += try_u64(buf.len())?;
+        self.bytes_written += buf.len();
         match writer.write(buf) {
             Ok(_) => Ok(buf.len()),
             Err(err) => Err(SstError::Write(format!(
@@ -196,8 +206,8 @@ impl BlockBuilder {
     }
 
     fn is_done(&self) -> bool {
-        self.bytes_written >= self.write_settings.block_length
-            || self.bytes_written >= self.write_settings.block_size
+        self.bytes_written >= self.write_settings.target_keys_per_block
+            || self.bytes_written >= self.write_settings.target_block_size_bytes
             || (self.last_common_len == 0 && self.key_count > 1)
     }
 
@@ -221,12 +231,12 @@ impl<WC: WriteCursor> WriteTracker<WC> {
 }
 
 impl<WC: WriteCursor> WriteCursor for WriteTracker<WC> {
-    fn write(&mut self, buf: &[u8]) -> Result<(), FileError> {
+    fn write(&mut self, buf: &[u8]) -> Result<(), BlobStoreError> {
         self.bytes_written += buf.len();
         self.writer.write(buf)
     }
 
-    fn finalize(self) -> Result<(), FileError> {
+    fn finalize(self) -> Result<(), BlobStoreError> {
         self.writer.finalize()
     }
 }
@@ -329,9 +339,9 @@ impl<B: BlobStore> SstWriter<B> {
         &self,
         is_minor_sst: bool,
         includes_tombstones: bool,
-    ) -> Result<SstBuilder<B::WC>, SstError> {
+    ) -> Result<SstBuilder<B::WriteCursor>, SstError> {
         let mut blob_id: String;
-        let blob_writer: <B as BlobStore>::WC;
+        let blob_writer: <B as BlobStore>::WriteCursor;
 
         // TODO(t/1374): The maximum retry count should be
         // configurable.

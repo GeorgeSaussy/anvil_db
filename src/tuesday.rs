@@ -4,20 +4,16 @@ mod test {
     use std::thread;
 
     use crate::anvil_db::AnvilDbConfig;
+    use crate::context::SimpleContext;
     use crate::logging::debug;
     use crate::logging::DefaultLogger;
-    use crate::sst::block_cache::NoBlockCache;
-    use crate::sst::block_cache::SimpleStorageWrapper;
+    use crate::sst::block_cache::cache::LruBlockCache;
     use crate::storage::blob_store::InMemoryBlobStore;
-    use crate::tablet::SmartTablet;
     use crate::var_int::VarInt64;
     use crate::AnvilDb;
 
-    // TODO(t/1387): This should use the real block cache when it is
-    // implemented.
-    type TestOnlyStorageWrapper = SimpleStorageWrapper<InMemoryBlobStore, NoBlockCache>;
-    type TestOnlyAnvilDb =
-        AnvilDb<TestOnlyStorageWrapper, SmartTablet<TestOnlyStorageWrapper>, DefaultLogger>;
+    type TestOnlyContext = SimpleContext<InMemoryBlobStore, LruBlockCache, DefaultLogger>;
+    type TestOnlyAnvilDb = AnvilDb<TestOnlyContext>;
 
     /// Set even key indexes.
     fn set_evens_as_value_1(

@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, future::Future, sync::mpsc::Receiver, task::Poll};
 
 use crate::var_int::VarInt64;
 
@@ -68,6 +68,30 @@ pub(crate) fn try_usize(val: u64) -> Result<usize, CastError> {
 pub(crate) fn try_length_prefix(buf: &[u8]) -> Result<Vec<u8>, CastError> {
     let len = VarInt64::try_from(buf.len())?;
     Ok(join_byte_arrays(vec![len.data_ref(), buf]))
+}
+
+pub(crate) struct ResultPoller<T> {
+    receiver: Receiver<T>,
+}
+
+impl<T> ResultPoller<T> {
+    pub(crate) fn new(receiver: Receiver<T>) -> Self {
+        ResultPoller { receiver }
+    }
+}
+
+impl<T> Future for ResultPoller<T> {
+    type Output = T;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if let Ok(t) = self.receiver.try_recv() {
+            return Poll::Ready(t);
+        }
+        Poll::Pending
+    }
 }
 
 #[cfg(test)]

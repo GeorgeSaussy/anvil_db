@@ -23,8 +23,6 @@ pub(crate) enum WalWrapperConfigPreset {
     },
     MultiThreadedLazySyncRequired,
     MultiThreadedNoSyncRequired,
-    SingleThreadedSyncRequired,
-    SingleThreadedNoSync,
 }
 
 impl Default for WalWrapperConfigPreset {
@@ -59,18 +57,12 @@ impl From<WalWrapperConfigPreset> for WalWrapperConfig {
             } => Some(max_buffered_entry_count),
             WalWrapperConfigPreset::MultiThreadedLazySyncRequired => None,
             WalWrapperConfigPreset::MultiThreadedNoSyncRequired => None,
-            // TODO(t/1374): Handle this case.
-            WalWrapperConfigPreset::SingleThreadedSyncRequired => todo!(),
-            // TODO(t/1374): Handle this case.
-            WalWrapperConfigPreset::SingleThreadedNoSync => todo!(),
         };
         let return_ok_before_flush = match config {
             WalWrapperConfigPreset::AutoTune { .. } => true,
             WalWrapperConfigPreset::MultiThreadedSyncRequired { .. } => false,
             WalWrapperConfigPreset::MultiThreadedLazySyncRequired => false,
             WalWrapperConfigPreset::MultiThreadedNoSyncRequired => true,
-            WalWrapperConfigPreset::SingleThreadedSyncRequired => true,
-            WalWrapperConfigPreset::SingleThreadedNoSync => false,
         };
         let target_wal_size_bytes = 2 * 1024 * 1024 * 1024; // 2 GiB
         let max_flush_wait_millis: Option<u64> = match config {
@@ -81,8 +73,6 @@ impl From<WalWrapperConfigPreset> for WalWrapperConfig {
             } => Some(max_flush_wait_millis),
             WalWrapperConfigPreset::MultiThreadedLazySyncRequired => None,
             WalWrapperConfigPreset::MultiThreadedNoSyncRequired => None,
-            WalWrapperConfigPreset::SingleThreadedSyncRequired => Some(0),
-            WalWrapperConfigPreset::SingleThreadedNoSync => None,
         };
         WalWrapperConfig {
             next_wal_id: 0,
@@ -155,13 +145,13 @@ impl RecoveryData {
     }
 }
 
-pub(crate) struct WalWrapper<B: BlobStore> {
+pub(crate) struct WalWrapper {
     blob_id: String,
-    active_wal: WalWriter<B::WC>,
+    active_wal: WalWriter,
     config: WalWrapperConfig,
 }
 
-impl<B: BlobStore> Clone for WalWrapper<B> {
+impl Clone for WalWrapper {
     fn clone(&self) -> Self {
         Self {
             blob_id: self.blob_id.clone(),
@@ -171,7 +161,7 @@ impl<B: BlobStore> Clone for WalWrapper<B> {
     }
 }
 
-impl<B: BlobStore> Debug for WalWrapper<B> {
+impl Debug for WalWrapper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WalWrapper")
             .field("blob_id", &self.blob_id)
@@ -188,13 +178,16 @@ struct BlobRecoveryData {
     garbage_sst_blob_ids: HashSet<String>,
 }
 
-impl<B: BlobStore> WalWrapper<B>
-where
-    B::WC: Send + Sync + 'static,
-{
-    pub(crate) fn new(blob_store: B, config: WalWrapperConfig) -> Result<WalWrapper<B>, WalError> {
+impl WalWrapper {
+    pub(crate) fn new<B: BlobStore>(
+        blob_store_ref: &B,
+        config: WalWrapperConfig,
+    ) -> Result<WalWrapper, WalError>
+    where
+        B::WriteCursor: Send + Sync + 'static,
+    {
         let blob_id = format!("wal.{}.log", config.next_wal_id);
-        let blob_writer = match blob_store.create_blob(&blob_id) {
+        let blob_writer = match blob_store_ref.create_blob(&blob_id) {
             Ok(blob_writer) => blob_writer,
             Err(err) => {
                 return Err(WalError::BlobStoreError(format!(
@@ -225,10 +218,13 @@ where
         &self.config
     }
 
-    pub(crate) fn recover(
+    pub(crate) fn recover<B: BlobStore>(
         blob_store: B,
         config: WalWrapperConfig,
-    ) -> Result<(WalWrapper<B>, RecoveryData), WalError> {
+    ) -> Result<(WalWrapper, RecoveryData), WalError>
+    where
+        B::WriteCursor: Send + Sync + 'static,
+    {
         // list blobs for log files
         let blob_iter = match blob_store.blob_iter() {
             Ok(blob_iter) => blob_iter,
@@ -304,11 +300,11 @@ where
             next_wal_id: my_wal_id + 1,
         };
         let config = config.with_next_wal_id(my_wal_id);
-        let wrapper = WalWrapper::new(blob_store, config)?;
+        let wrapper = WalWrapper::new(&blob_store, config)?;
         Ok((wrapper, recovery_data))
     }
 
-    fn recover_from_blob(
+    fn recover_from_blob<B: BlobStore>(
         blob_store: &B,
         blob_name: &str,
         start_sst_blob_ids: Option<Vec<String>>,
@@ -432,6 +428,10 @@ where
         self.active_wal.write(entry)
     }
 
+    async fn async_write_entry(&self, entry: WalEntry) -> Result<(), WalError> {
+        self.active_wal.async_write(entry).await
+    }
+
     pub(crate) fn set<T: TombstoneValueLike>(&self, key: &[u8], value: &T) -> Result<(), WalError> {
         if let Some(value) = value.as_ref() {
             return self.write_entry(WalEntry::Set {
@@ -440,6 +440,23 @@ where
             });
         }
         self.write_entry(WalEntry::Remove { key: key.to_vec() })
+    }
+
+    pub(crate) async fn async_set<T: TombstoneValueLike>(
+        &self,
+        key: &[u8],
+        value: &T,
+    ) -> Result<(), WalError> {
+        if let Some(value) = value.as_ref() {
+            return self
+                .async_write_entry(WalEntry::Set {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                })
+                .await;
+        }
+        self.async_write_entry(WalEntry::Remove { key: key.to_vec() })
+            .await
     }
 
     pub(crate) fn mark_minor_compaction(
@@ -484,11 +501,11 @@ mod test {
         run_test_wal_wrapper(blob_store);
     }
 
-    fn run_test_wal_wrapper<T: BlobStore + Clone + 'static>(blob_store: T)
+    fn run_test_wal_wrapper<B: BlobStore + Clone + 'static>(blob_store: B)
     where
-        T::WC: Send + Sync + 'static,
+        B::WriteCursor: Send + Sync + 'static,
     {
-        let wal_wrapper = WalWrapper::new(blob_store.clone(), WalWrapperConfig::default()).unwrap();
+        let wal_wrapper = WalWrapper::new(&blob_store, WalWrapperConfig::default()).unwrap();
         let top: u64 = 299;
         for k in 0..top {
             if k % 2 == 0 {
@@ -510,7 +527,7 @@ mod test {
 
         // Recover the WAL
         let (wal_wrapper, recovery_data) =
-            WalWrapper::<T>::recover(blob_store.clone(), WalWrapperConfig::default()).unwrap();
+            WalWrapper::recover(blob_store.clone(), WalWrapperConfig::default()).unwrap();
         let mut update_map: HashMap<Vec<u8>, TombstoneValue> = HashMap::new();
         for pair in recovery_data.un_compacted_updates[0].1.iter() {
             let key = pair.key_ref();
@@ -549,7 +566,7 @@ mod test {
         assert!(wal_wrapper.close().is_ok());
 
         let (wal_wrapper, recovery_data) =
-            WalWrapper::<T>::recover(blob_store, WalWrapperConfig::default()).unwrap();
+            WalWrapper::recover(blob_store, WalWrapperConfig::default()).unwrap();
         let mut update_map = HashMap::new();
         for un_compacted_updates in &recovery_data.un_compacted_updates {
             for pair in &un_compacted_updates.1 {

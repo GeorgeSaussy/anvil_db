@@ -1,6 +1,5 @@
+pub mod block_scanner;
 pub mod cache;
-mod concurrent_hash_map;
-mod storage_wrapper;
+pub mod common;
 
-pub(crate) use cache::{BlockCache, NoBlockCache};
-pub(crate) use storage_wrapper::{SimpleStorageWrapper, StorageWrapper};
+pub(crate) use cache::BlockCache;
