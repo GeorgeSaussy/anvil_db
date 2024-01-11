@@ -2,3 +2,9 @@
 name = "anvil_db"
 version = "0.2.0"
 edition = "2021"
+license = "MIT"
+description = "an embedded key-value store"
+repository = "https://github.com/georgesaussy/anvil_db"
+readme = "README.md"
+keywords = ["database"]
+categories = ["database", "concurrency"]
