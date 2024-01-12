@@ -1,4 +1,6 @@
 use std::cmp::Ordering;
+use std::error::Error;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 
 use crate::common::{cmp_key, CastError};
 use crate::sst::block_cache::common::CacheError;
@@ -11,6 +13,20 @@ pub(crate) enum SstReadError {
     PossibleCorruption(String),
 }
 
+impl Display for SstReadError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            SstReadError::Cache(err) => write!(f, "cache error: {}", err),
+            SstReadError::BlobStore((file, err)) => {
+                write!(f, "blob store error: {} for file: {}", err, file)
+            }
+            SstReadError::PossibleCorruption(err) => write!(f, "possible corruption: {}", err),
+        }
+    }
+}
+
+impl Error for SstReadError {}
+
 #[derive(Debug)]
 pub(crate) enum SstError {
     Parse(String),
@@ -19,6 +35,20 @@ pub(crate) enum SstError {
     Internal(String),
     EmptySst(String),
 }
+
+impl Display for SstError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            SstError::Parse(err) => write!(f, "parse error: {}", err),
+            SstError::Write(err) => write!(f, "write error: {}", err),
+            SstError::Read(err) => write!(f, "read error: {}", err),
+            SstError::Internal(err) => write!(f, "internal error: {}", err),
+            SstError::EmptySst(err) => write!(f, "empty sst: {}", err),
+        }
+    }
+}
+
+impl Error for SstError {}
 
 impl From<SstReadError> for SstError {
     fn from(err: SstReadError) -> Self {

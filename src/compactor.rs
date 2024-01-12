@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::error::Error;
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::iter::zip;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::sleep;
@@ -27,6 +28,30 @@ pub(crate) enum CompactorError {
     SstError(SstError),
     DeletionError,
 }
+
+impl Display for CompactorError {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        match self {
+            CompactorError::FailedToObtainReader(blob_ids) => {
+                write!(f, "failed to obtain reader for blobs: {:?}", blob_ids)
+            }
+            CompactorError::NothingToCompact => {
+                write!(f, "nothing to compact")
+            }
+            CompactorError::BlobStoreError(err) => {
+                write!(f, "blob store error: {}", err)
+            }
+            CompactorError::SstError(err) => {
+                write!(f, "sst error: {}", err)
+            }
+            CompactorError::DeletionError => {
+                write!(f, "deletion error")
+            }
+        }
+    }
+}
+
+impl Error for CompactorError {}
 
 impl From<BlobStoreError> for CompactorError {
     fn from(err: BlobStoreError) -> Self {

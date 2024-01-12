@@ -1,4 +1,5 @@
-use std::fmt::{Debug, Formatter};
+use std::error::Error;
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::sync::mpsc::{channel, Sender};
 use std::thread::spawn;
 
@@ -24,6 +25,18 @@ pub(crate) enum MemTableError {
     Sst(SstError),
     Wal(WalError),
 }
+
+impl Display for MemTableError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            MemTableError::Compactor(err) => write!(f, "CompactorError: {:?}", err),
+            MemTableError::Sst(err) => write!(f, "SstError: {:?}", err),
+            MemTableError::Wal(err) => write!(f, "WalError: {:?}", err),
+        }
+    }
+}
+
+impl Error for MemTableError {}
 
 impl From<WalError> for MemTableError {
     fn from(err: WalError) -> Self {

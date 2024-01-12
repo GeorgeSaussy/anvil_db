@@ -1,3 +1,5 @@
+use std::error::Error;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::string::FromUtf8Error;
 
 use crate::checksum::crc32;
@@ -14,6 +16,22 @@ pub(crate) enum WalError {
     RotationRequired,
     FinalizedWal,
 }
+
+impl Display for WalError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            WalError::WriteEntryError(err) => write!(f, "error while writing wal entry: {}", err),
+            WalError::BlobStoreError(err) => write!(f, "blob store error: {}", err),
+            WalError::InvalidInput(Some(err)) => write!(f, "invalid input: {}", err),
+            WalError::InvalidInput(None) => write!(f, "invalid input"),
+            WalError::RecoveryError(err) => write!(f, "error while recovering wal: {}", err),
+            WalError::RotationRequired => write!(f, "wal rotation required"),
+            WalError::FinalizedWal => write!(f, "wal is finalized"),
+        }
+    }
+}
+
+impl Error for WalError {}
 
 impl From<CastError> for WalError {
     fn from(err: CastError) -> Self {
