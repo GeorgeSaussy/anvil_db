@@ -2,6 +2,8 @@
 // TODO(t/1239): Stop allowing dead code.
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::fs::{canonicalize, create_dir_all, read_dir, remove_file, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -28,6 +30,14 @@ impl BlobStoreError {
         BlobStoreError::ReadError(Some(format!("underlying storage error: {:?}", err)))
     }
 }
+
+impl Display for BlobStoreError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl Error for BlobStoreError {}
 
 impl From<BlobStoreError> for String {
     fn from(value: BlobStoreError) -> Self {
