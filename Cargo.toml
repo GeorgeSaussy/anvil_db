@@ -8,3 +8,10 @@ repository = "https://github.com/georgesaussy/anvil_db"
 readme = "README.md"
 keywords = ["database"]
 categories = ["database", "concurrency"]
+
+[target.x86_64-unknown-linux-gnu]
+linker = "/usr/bin/clang"
+rustflags = ["-Clink-arg=-fuse-ld=lld", "-Clink-arg=-Wl,--no-rosegment"]
+
+[profile.release]
+debug = true

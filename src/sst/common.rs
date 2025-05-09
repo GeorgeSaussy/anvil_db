@@ -16,11 +16,11 @@ pub(crate) enum SstReadError {
 impl Display for SstReadError {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
-            SstReadError::Cache(err) => write!(f, "cache error: {}", err),
+            SstReadError::Cache(err) => write!(f, "cache error: {err}",),
             SstReadError::BlobStore((file, err)) => {
-                write!(f, "blob store error: {} for file: {}", err, file)
+                write!(f, "blob store error: {err} for file: {file}",)
             }
-            SstReadError::PossibleCorruption(err) => write!(f, "possible corruption: {}", err),
+            SstReadError::PossibleCorruption(err) => write!(f, "possible corruption: {err}",),
         }
     }
 }
@@ -39,11 +39,11 @@ pub(crate) enum SstError {
 impl Display for SstError {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
-            SstError::Parse(err) => write!(f, "parse error: {}", err),
-            SstError::Write(err) => write!(f, "write error: {}", err),
-            SstError::Read(err) => write!(f, "read error: {}", err),
-            SstError::Internal(err) => write!(f, "internal error: {}", err),
-            SstError::EmptySst(err) => write!(f, "empty sst: {}", err),
+            SstError::Parse(err) => write!(f, "parse error: {err}",),
+            SstError::Write(err) => write!(f, "write error: {err}",),
+            SstError::Read(err) => write!(f, "read error: {err}",),
+            SstError::Internal(err) => write!(f, "internal error: {err}",),
+            SstError::EmptySst(err) => write!(f, "empty sst: {err}",),
         }
     }
 }
@@ -58,13 +58,13 @@ impl From<SstReadError> for SstError {
 
 impl From<CastError> for SstError {
     fn from(err: CastError) -> Self {
-        SstError::Parse(format!("could not parse u64 from usize: {:?}", err))
+        SstError::Parse(format!("could not parse u64 from usize: {err:?}",))
     }
 }
 
 impl From<BlobStoreError> for SstError {
     fn from(err: BlobStoreError) -> Self {
-        SstError::Internal(format!("could not write to file: {:?}", err))
+        SstError::Internal(format!("could not write to file: {err:?}",))
     }
 }
 
@@ -76,7 +76,7 @@ impl From<CacheError> for SstError {
 
 impl From<SstError> for String {
     fn from(err: SstError) -> Self {
-        format!("SstError: {:?}", err)
+        format!("SstError: {err:?}",)
     }
 }
 
@@ -182,7 +182,7 @@ impl<'a> RefKeyRange<'a> {
     }
 }
 
-impl<'a> KeyRangeLike for RefKeyRange<'a> {
+impl KeyRangeLike for RefKeyRange<'_> {
     fn start_ref(&self) -> &[u8] {
         self.start
     }

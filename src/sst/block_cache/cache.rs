@@ -12,6 +12,8 @@ use crate::storage::blob_store::{BlobStore, ReadCursor};
 /// A clone of the implementation must still refer to the same underlying data.
 /// Memory usage is an approximation. It should take into account the size of
 /// the cached blocks, and any overhead that is not constant.
+// TODO(gs): Stop allowing dead code.
+#[allow(dead_code)]
 pub(crate) trait BlockCache: Clone {
     fn with_capacity(max_blocks_cached: usize) -> Self;
     /// Reads the exact number of bytes into the destination buffer.

@@ -104,8 +104,7 @@ mod tests {
         let expect = 3904355907;
         assert_eq!(
             checksum, expect,
-            "expected {:#02X} but got {:#02X}",
-            expect, checksum
+            "expected {expect:#02X} but got {checksum:#02X}",
         );
     }
 

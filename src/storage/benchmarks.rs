@@ -14,7 +14,7 @@ mod test {
     #[bench]
     fn bench_writing_file_with_native_api(b: &mut Bencher) {
         let work_dir = set_up("bench_writing_file_with_native_api");
-        let path = format!("{}/output.txt", work_dir);
+        let path = format!("{work_dir}/output.txt",);
 
         b.iter(|| {
             let start = Instant::now();
@@ -30,7 +30,7 @@ mod test {
                 total_bytes += new_bytes;
             }
             let end = Instant::now();
-            debug!("Elapsed: {} ms", (end - start).as_millis());
+            debug!(&(), "Elapsed: {} ms", (end - start).as_millis());
         });
 
         tear_down(&work_dir);
@@ -52,7 +52,7 @@ mod test {
                 total_bytes += buf.len();
             }
             let end = Instant::now();
-            debug!("Elapsed: {} ms", (end - start).as_millis());
+            debug!(&(), "Elapsed: {} ms", (end - start).as_millis());
         });
 
         tear_down(&work_dir);

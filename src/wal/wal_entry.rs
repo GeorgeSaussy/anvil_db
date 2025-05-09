@@ -4,6 +4,7 @@ use std::string::FromUtf8Error;
 
 use crate::checksum::crc32;
 use crate::common::{try_length_prefix, CastError};
+use crate::kv::TombstoneValueLike;
 use crate::storage::blob_store::{BlobStoreError, ReadCursor, WriteCursor};
 use crate::var_int::VarInt64;
 
@@ -13,19 +14,17 @@ pub(crate) enum WalError {
     BlobStoreError(String),
     InvalidInput(Option<String>),
     RecoveryError(String),
-    RotationRequired,
     FinalizedWal,
 }
 
 impl Display for WalError {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
-            WalError::WriteEntryError(err) => write!(f, "error while writing wal entry: {}", err),
-            WalError::BlobStoreError(err) => write!(f, "blob store error: {}", err),
-            WalError::InvalidInput(Some(err)) => write!(f, "invalid input: {}", err),
+            WalError::WriteEntryError(err) => write!(f, "error while writing wal entry: {err}",),
+            WalError::BlobStoreError(err) => write!(f, "blob store error: {err}",),
+            WalError::InvalidInput(Some(err)) => write!(f, "invalid input: {err}",),
             WalError::InvalidInput(None) => write!(f, "invalid input"),
-            WalError::RecoveryError(err) => write!(f, "error while recovering wal: {}", err),
-            WalError::RotationRequired => write!(f, "wal rotation required"),
+            WalError::RecoveryError(err) => write!(f, "error while recovering wal: {err}",),
             WalError::FinalizedWal => write!(f, "wal is finalized"),
         }
     }
@@ -35,19 +34,19 @@ impl Error for WalError {}
 
 impl From<CastError> for WalError {
     fn from(err: CastError) -> Self {
-        WalError::InvalidInput(Some(format!("cast error: {:?}", err)))
+        WalError::InvalidInput(Some(format!("cast error: {err:?}",)))
     }
 }
 
 impl From<FromUtf8Error> for WalError {
     fn from(err: FromUtf8Error) -> Self {
-        WalError::InvalidInput(Some(format!("utf8 error: {:?}", err)))
+        WalError::InvalidInput(Some(format!("utf8 error: {err:?}",)))
     }
 }
 
 impl From<BlobStoreError> for WalError {
     fn from(value: BlobStoreError) -> Self {
-        WalError::BlobStoreError(format!("{:?}", value))
+        WalError::BlobStoreError(format!("{value:?}",))
     }
 }
 
@@ -80,6 +79,19 @@ pub(crate) enum WalEntry {
         /// ordered from oldest to newest
         sst_blob_ids: Vec<String>,
     },
+}
+
+impl<T: TombstoneValueLike> From<(&[u8], &T)> for WalEntry {
+    fn from((key, value): (&[u8], &T)) -> Self {
+        if let Some(value) = value.as_ref() {
+            WalEntry::Set {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            }
+        } else {
+            WalEntry::Remove { key: key.to_vec() }
+        }
+    }
 }
 
 impl WalEntry {
@@ -223,8 +235,7 @@ impl WalEntryBlock {
         let mut checksum_le_buf = [0_u8; 4];
         if let Err(err) = reader.read_exact(&mut checksum_le_buf) {
             return Err(WalError::RecoveryError(format!(
-                "could not read checksum from blob: {:?}",
-                err
+                "could not read checksum from blob: {err:?}",
             )));
         }
         if checksum_le_buf != checksum.to_le_bytes() {
@@ -254,8 +265,7 @@ impl WalEntryBlock {
         let mut buf = [0_u8];
         if let Err(err) = reader.read_exact(&mut buf) {
             return Err(WalError::RecoveryError(format!(
-                "could not read entry tag: {:?}",
-                err
+                "could not read entry tag: {err:?}",
             )));
         };
         let checksum = crc32(prev_checksum, &buf);
@@ -373,20 +383,14 @@ impl WalEntryBlock {
         len: usize,
         prev: Checksum,
     ) -> Result<BlockWriteData, WalError> {
-        let start1 = start;
-        let len1 = len / 2;
-        let block_data = match self.write_entries(writer, start1, len1, prev) {
-            Ok(check) => check,
-            Err(err) => return Err(err),
-        };
+        let start_1 = start;
+        let len_1 = len / 2;
+        let block_data = self.write_entries(writer, start_1, len_1, prev)?;
         let prev_bytes_written = block_data.bytes_written;
-        let start2 = start + len1;
-        let len2 = len - len1;
+        let start_2 = start + len_1;
+        let len_2 = len - len_1;
         let mut block_data =
-            match self.write_entries_halved(writer, start2, len2, block_data.checksum) {
-                Ok(check) => check,
-                Err(err) => return Err(err),
-            };
+            self.write_entries_halved(writer, start_2, len_2, block_data.checksum)?;
         block_data.bytes_written += prev_bytes_written;
         Ok(block_data)
     }
@@ -407,7 +411,7 @@ impl WalEntryBlock {
             return self.write_entries_halved(writer, start, len, prev);
         };
         if let Err(err) = writer.write(count.data_ref()) {
-            return Err(WalError::WriteEntryError(format!("{:?}", err)));
+            return Err(WalError::WriteEntryError(format!("{err:?}",)));
         }
         let mut checksum = crc32(prev, count.data_ref());
         let mut entry_buf = Vec::new();
@@ -418,7 +422,7 @@ impl WalEntryBlock {
         checksum = crc32(checksum, &entry_buf);
         entry_buf.extend(checksum.to_le_bytes());
         if let Err(err) = writer.write(&entry_buf) {
-            return Err(WalError::WriteEntryError(format!("{:?}", err)));
+            return Err(WalError::WriteEntryError(format!("{err:?}",)));
         }
         Ok(BlockWriteData {
             checksum,

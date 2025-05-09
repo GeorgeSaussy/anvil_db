@@ -1,0 +1,8 @@
+name: anvil_db
+test:
+  image: rust:latest
+  script:
+    - rustup default nightly
+    - rustup component add rustfmt
+    - rustup component add clippy
+    - make presubmit

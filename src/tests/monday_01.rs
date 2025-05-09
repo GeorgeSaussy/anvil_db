@@ -15,12 +15,12 @@ mod test {
     fn test_tiny_recovery() {
         let top: usize = 10;
 
-        debug!("OPEN A NEW DB");
+        debug!(&(), "OPEN A NEW DB");
         let store = InMemoryBlobStore::new();
 
         let jdb: TestOnlyAnvilDb = AnvilDb::new(store.clone()).unwrap();
 
-        debug!("CREATE SOME DATA");
+        debug!(&(), "CREATE SOME DATA");
         let mut keys = Vec::new();
         let mut values = Vec::new();
         for k in 0..top {
@@ -31,7 +31,7 @@ mod test {
         }
         let dummy = vec![0, 0, 0];
 
-        debug!("SET EVENS AS VALUES_1");
+        debug!(&(), "SET EVENS AS VALUES_1");
         for k in 0..top {
             if k % 2 != 0 {
                 continue;
@@ -50,7 +50,7 @@ mod test {
 
         assert!(jdb.close().is_ok());
 
-        debug!("CHECK VALUES SURVIVED RECOVERY");
+        debug!(&(), "CHECK VALUES SURVIVED RECOVERY");
         let jdb: TestOnlyAnvilDb = AnvilDb::recover(store, AnvilDbConfig::default()).unwrap();
 
         for k in 0..top {
@@ -61,7 +61,7 @@ mod test {
             }
             let val = &values[k];
             let found = jdb.get(key.data_ref()).unwrap().unwrap();
-            assert_eq!(found, val.data_ref().to_vec(), "k: {}", k);
+            assert_eq!(found, val.data_ref().to_vec(), "k: {k}",);
         }
 
         assert!(jdb.close().is_ok());
@@ -72,12 +72,12 @@ mod test {
         // TODO(t/1388): This number should be bigger.
         let top: usize = 500_usize;
 
-        debug!("OPEN A NEW DB");
+        debug!(&(), "OPEN A NEW DB");
         let store = InMemoryBlobStore::new();
 
         let jdb: TestOnlyAnvilDb = AnvilDb::new(store.clone()).unwrap();
 
-        debug!("CREATE SOME DATA");
+        debug!(&(), "CREATE SOME DATA");
         let mut keys = Vec::new();
         let mut values_1 = Vec::new();
         let mut values_2 = Vec::new();
@@ -96,7 +96,7 @@ mod test {
         }
         let dummy = vec![0, 0, 0];
 
-        debug!("SET EVENS AS VALUES_1");
+        debug!(&(), "SET EVENS AS VALUES_1");
         for k in 0..top {
             if k % 2 != 0 {
                 continue;
@@ -123,7 +123,7 @@ mod test {
 
         assert!(jdb.close().is_ok());
 
-        debug!("CHECK VALUES SURVIVED RECOVERY");
+        debug!(&(), "CHECK VALUES SURVIVED RECOVERY");
         let jdb: TestOnlyAnvilDb =
             AnvilDb::recover(store.clone(), AnvilDbConfig::default()).unwrap();
 
@@ -134,10 +134,10 @@ mod test {
             let key = &keys[k];
             let val = &values_1[k];
             let found = unwrap!(unwrap!(jdb.get(key.data_ref())));
-            assert_eq!(found, val.data_ref().to_vec(), "k: {}", k);
+            assert_eq!(found, val.data_ref().to_vec(), "k: {k}",);
         }
 
-        debug!("WRITE ODDS AS VALUES_2");
+        debug!(&(), "WRITE ODDS AS VALUES_2");
         for k in 1..top {
             if k % 2 != 1 {
                 continue;
@@ -151,7 +151,7 @@ mod test {
 
         assert!(jdb.close().is_ok());
 
-        debug!("CHECK ALL VALUES SURVIVED RECOVERY");
+        debug!(&(), "CHECK ALL VALUES SURVIVED RECOVERY");
         let jdb: TestOnlyAnvilDb =
             AnvilDb::recover(store.clone(), AnvilDbConfig::default()).unwrap();
 
@@ -165,7 +165,7 @@ mod test {
             assert_eq!(jdb.get(key.data_ref()).unwrap().unwrap(), val.data_ref());
         }
 
-        debug!("CHECK OVERRIDING SOME VALUES");
+        debug!(&(), "CHECK OVERRIDING SOME VALUES");
         for k in top / 2..top {
             // first check that it is what we expect
             let key = &keys[k];
@@ -182,12 +182,12 @@ mod test {
             assert_eq!(jdb.get(key.data_ref()).unwrap().unwrap(), val.data_ref());
         }
 
-        debug!("CLOSE AND RECOVER");
+        debug!(&(), "CLOSE AND RECOVER");
         assert!(jdb.close().is_ok());
         let jdb: TestOnlyAnvilDb =
             AnvilDb::recover(store.clone(), AnvilDbConfig::default()).unwrap();
 
-        debug!("CHECK THE VALUES CAN BE DELETED");
+        debug!(&(), "CHECK THE VALUES CAN BE DELETED");
         for k in 0..top {
             let key = &keys[k];
 
@@ -211,7 +211,7 @@ mod test {
             assert!(jdb.get(key.data_ref()).unwrap().is_none());
         }
 
-        debug!("CLOSE, RECOVER, CHECK EMPTY");
+        debug!(&(), "CLOSE, RECOVER, CHECK EMPTY");
         assert!(jdb.close().is_ok());
         let jdb: TestOnlyAnvilDb =
             AnvilDb::recover(store.clone(), AnvilDbConfig::default()).unwrap();
@@ -220,7 +220,7 @@ mod test {
             assert!(jdb.get(key.data_ref()).unwrap().is_none());
         }
 
-        debug!("CLEAN UP");
+        debug!(&(), "CLEAN UP");
         assert!(jdb.close().is_ok());
     }
 }

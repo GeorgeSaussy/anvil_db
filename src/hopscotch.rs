@@ -577,10 +577,10 @@ impl<K, V> Bucket<K, V> {
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
-    use std::thread::spawn;
 
     use super::*;
     use crate::checksum::crc32;
+    use crate::helpful_macros::spawn;
     use crate::helpful_macros::unwrap;
     use crate::logging::debug;
 
@@ -607,7 +607,7 @@ mod test {
         let mut handles = Vec::with_capacity(top);
         for thread_idx in 0..n_threads {
             let map = map.clone();
-            let handle = spawn(move || {
+            let handle = spawn!(move || {
                 for i in 0..top {
                     let ii = (top * thread_idx + i) as u32;
                     let found = map.get(&HashU32(ii));
@@ -615,7 +615,7 @@ mod test {
                     map.set(HashU32(ii), ii);
                     let found = map.get(&HashU32(ii));
                     assert_eq!(unwrap!(found), ii);
-                    debug!("set done: thread_idx: {}, i: {}", thread_idx, i);
+                    debug!(&(), "set done: thread_idx: {}, i: {}", thread_idx, i);
                 }
                 for i in 0..top {
                     let ii = (top * thread_idx + i) as u32;
@@ -624,7 +624,7 @@ mod test {
                     map.remove(&HashU32(ii));
                     let found = map.get(&HashU32(ii));
                     assert!(found.is_none());
-                    debug!("remove done: thread_idx: {}, i: {}", thread_idx, i);
+                    debug!(&(), "remove done: thread_idx: {}, i: {}", thread_idx, i);
                 }
             });
             handles.push(handle);

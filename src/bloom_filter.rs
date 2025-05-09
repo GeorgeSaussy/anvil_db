@@ -18,9 +18,9 @@ fn murmur_hash_3_32(key: &[u8], seed: u32) -> u32 {
     for i in 0..num_blocks {
         let block_idx = 4 * i;
         let mut k1 = key[block_idx] as u32
-            | (key[block_idx + 1] as u32) << 8
-            | (key[block_idx + 2] as u32) << 16
-            | (key[block_idx + 3] as u32) << 24;
+            | ((key[block_idx + 1] as u32) << 8)
+            | ((key[block_idx + 2] as u32) << 16)
+            | ((key[block_idx + 3] as u32) << 24);
 
         k1 = k1.wrapping_mul(C1);
         rotl_32(&mut k1, 15);

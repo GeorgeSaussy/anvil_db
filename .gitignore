@@ -1,3 +1,6 @@
 Cargo.lock
 old
 target
+bench/*
+flamegraph.svg
+perf.data

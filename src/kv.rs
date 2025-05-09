@@ -7,6 +7,8 @@ use crate::common::{cmp_key, join_byte_arrays, try_u64};
 use crate::context::Context;
 use crate::var_int::VarInt64;
 
+// TODO(gs): Stop allowing dead code.
+#[allow(dead_code)]
 pub(crate) trait KeyValuePointReader {
     type Error;
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
@@ -198,6 +200,8 @@ pub(crate) trait TombstoneIterator:
     type Error;
 }
 
+// TODO(gs): Stop allowing dead code.
+#[allow(dead_code)]
 pub(crate) trait AsyncTombstoneIterator:
     RangeSet + AsyncIterator<Item = Result<TombstonePair, Self::Error>>
 {
@@ -213,13 +217,15 @@ pub(crate) trait TombstoneScanner {
 
 pub(crate) trait TryTombstoneScanner {
     type Error;
-    type Iter<Ctx>: TombstoneIterator<Error = Self::Error>
+    type Iter<'a, Ctx>: TombstoneIterator<Error = Self::Error>
     where
-        Ctx: Context;
+        Ctx: Context + 'a;
 
-    fn try_scan<Ctx: Context>(&self, ctx: &Ctx) -> Result<Self::Iter<Ctx>, Self::Error>;
+    fn try_scan<'a, Ctx: Context>(&self, ctx: &'a Ctx) -> Result<Self::Iter<'a, Ctx>, Self::Error>;
 }
 
+// TODO(gs): Stop allowing dead code.
+#[allow(dead_code)]
 pub(crate) trait TryAsyncTombstoneScanner {
     type Error;
     type Iter: AsyncTombstoneIterator<Error = Self::Error>;
@@ -512,13 +518,9 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::cmp::Ordering;
 
     use super::*;
-    use crate::{
-        common::cmp_key,
-        concurrent_skip_list::{ConcurrentSkipList, ConcurrentSkipListScanner},
-    };
+    use crate::concurrent_skip_list::{ConcurrentSkipList, ConcurrentSkipListScanner};
 
     fn some_key() -> Vec<u8> {
         vec![0, 2, 3]

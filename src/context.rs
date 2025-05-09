@@ -1,3 +1,4 @@
+use crate::background::BackgroundExecutor;
 use crate::logging::Logger;
 use crate::sst::block_cache::BlockCache;
 use crate::storage::blob_store::BlobStore;
@@ -11,6 +12,7 @@ pub(crate) trait Context:
 
     fn blob_store_ref(&self) -> &Self::BlobStore;
     fn block_cache_ref(&self) -> &Self::BlockCache;
+    fn bg_ref(&self) -> &BackgroundExecutor;
     fn logger(&self) -> &Self::Logger;
 }
 
@@ -18,6 +20,7 @@ pub(crate) trait Context:
 pub(crate) struct SimpleContext<B: BlobStore, C: BlockCache, L: Logger> {
     blob_store: B,
     block_cache: C,
+    bg: BackgroundExecutor,
     logger: L,
 }
 
@@ -26,9 +29,11 @@ impl<B: BlobStore, C: BlockCache + Send + Sync + 'static, L: Logger> From<(B, C,
 {
     fn from(value: (B, C, L)) -> Self {
         let (blob_store, block_cache, logger) = value;
+        let bg = BackgroundExecutor::new();
         SimpleContext {
             blob_store,
             block_cache,
+            bg,
             logger,
         }
     }
@@ -51,5 +56,9 @@ impl<B: BlobStore, C: BlockCache + Send + Sync + 'static, L: Logger> Context
 
     fn logger(&self) -> &Self::Logger {
         &self.logger
+    }
+
+    fn bg_ref(&self) -> &BackgroundExecutor {
+        &self.bg
     }
 }

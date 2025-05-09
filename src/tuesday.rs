@@ -1,10 +1,9 @@
 #[cfg(test)]
 mod test {
 
-    use std::thread;
-
     use crate::anvil_db::AnvilDbConfig;
     use crate::context::SimpleContext;
+    use crate::helpful_macros::spawn;
     use crate::logging::debug;
     use crate::logging::DefaultLogger;
     use crate::sst::block_cache::cache::LruBlockCache;
@@ -173,11 +172,11 @@ mod test {
         let top = 500_usize;
         let n_threads = 4;
 
-        debug!("OPEN A NEW DB");
+        debug!(&(), "OPEN A NEW DB");
         let store = InMemoryBlobStore::new();
         let jdb: TestOnlyAnvilDb = AnvilDb::new(store.clone()).unwrap();
 
-        debug!("CREATE SOME DATA");
+        debug!(&(), "CREATE SOME DATA");
         let mut keys = Vec::with_capacity(top);
         let mut values_1 = Vec::with_capacity(top);
         let mut values_2 = Vec::with_capacity(top);
@@ -189,13 +188,13 @@ mod test {
             values_3.push(VarInt64::try_from(2 * k).unwrap());
         }
 
-        debug!("SET EVENS AS VALUES_1");
+        debug!(&(), "SET EVENS AS VALUES_1");
         let mut children = Vec::new();
         for t in 0..n_threads {
             let p_jdb = jdb.clone();
             let p_keys = keys.clone();
             let p_values_1 = values_1.clone();
-            children.push(thread::spawn(move || {
+            children.push(spawn!(move || {
                 set_evens_as_value_1(t, n_threads, top, &p_jdb, &p_keys, &p_values_1)
             }));
         }
@@ -208,7 +207,7 @@ mod test {
         let result = jdb.close();
         assert!(result.is_ok());
 
-        debug!("CHECK VALUES SURVIVED RECOVERY");
+        debug!(&(), "CHECK VALUES SURVIVED RECOVERY");
         let jdb: TestOnlyAnvilDb =
             AnvilDb::recover(store.clone(), AnvilDbConfig::default()).unwrap();
         let mut children = Vec::with_capacity(n_threads);
@@ -216,7 +215,7 @@ mod test {
             let p_jdb = jdb.clone();
             let p_keys = keys.clone();
             let p_values_1 = values_1.clone();
-            children.push(thread::spawn(move || {
+            children.push(spawn!(move || {
                 check_even_value_1_survived(t, n_threads, top, &p_jdb, &p_keys, &p_values_1)
             }));
         }
@@ -224,13 +223,13 @@ mod test {
             assert!(child.join().is_ok());
         }
 
-        debug!("WRITE ODDS AS VALUES_2");
+        debug!(&(), "WRITE ODDS AS VALUES_2");
         let mut children = Vec::with_capacity(n_threads);
         for t in 0..n_threads {
             let p_jdb = jdb.clone();
             let p_keys = keys.clone();
             let p_values_2 = values_2.clone();
-            children.push(thread::spawn(move || {
+            children.push(spawn!(move || {
                 set_odds_as_value2(t, n_threads, top, &p_jdb, &p_keys, &p_values_2)
             }));
         }
@@ -239,7 +238,7 @@ mod test {
         }
         assert!(jdb.close().is_ok());
 
-        debug!("CHECK ALL VALUES SURVIVED RECOVERY");
+        debug!(&(), "CHECK ALL VALUES SURVIVED RECOVERY");
         let jdb: TestOnlyAnvilDb =
             AnvilDb::recover(store.clone(), AnvilDbConfig::default()).unwrap();
         let mut children = Vec::with_capacity(n_threads);
@@ -248,7 +247,7 @@ mod test {
             let p_keys = keys.clone();
             let p_values_1 = values_1.clone();
             let p_values_2 = values_2.clone();
-            children.push(thread::spawn(move || {
+            children.push(spawn!(move || {
                 check_all_values_survived(
                     t,
                     n_threads,
@@ -264,7 +263,7 @@ mod test {
             assert!(child.join().is_ok());
         }
 
-        debug!("CHECK OVERRIDING SOME VALUES");
+        debug!(&(), "CHECK OVERRIDING SOME VALUES");
         let mut children = Vec::new();
         for t in 0..n_threads {
             let p_jdb = jdb.clone();
@@ -272,7 +271,7 @@ mod test {
             let p_values_1 = values_1.clone();
             let p_values_2 = values_2.clone();
             let p_values_3 = values_3.clone();
-            children.push(thread::spawn(move || {
+            children.push(spawn!(move || {
                 check_overriding_some_values(
                     t,
                     n_threads,
@@ -289,17 +288,17 @@ mod test {
             assert!(child.join().is_ok());
         }
 
-        debug!("CLOSE AND RECOVER");
+        debug!(&(), "CLOSE AND RECOVER");
         assert!(jdb.close().is_ok());
         let jdb: TestOnlyAnvilDb =
             AnvilDb::recover(store.clone(), AnvilDbConfig::default()).unwrap();
 
-        debug!("CHECK THE VALUES CAN BE DELETED");
+        debug!(&(), "CHECK THE VALUES CAN BE DELETED");
         let mut children = Vec::with_capacity(n_threads);
         for t in 0..n_threads {
             let p_jdb = jdb.clone();
             let p_keys = keys.clone();
-            children.push(thread::spawn(move || {
+            children.push(spawn!(move || {
                 check_values_can_be_deleted(t, n_threads, top, &p_jdb, &p_keys)
             }));
         }
@@ -310,14 +309,14 @@ mod test {
             }
         }
 
-        debug!("CLOSE, RECOVER, CHECK EMPTY");
+        debug!(&(), "CLOSE, RECOVER, CHECK EMPTY");
         assert!(jdb.close().is_ok());
         let jdb: TestOnlyAnvilDb = AnvilDb::recover(store, AnvilDbConfig::default()).unwrap();
         let mut children = Vec::with_capacity(n_threads);
         for t in 0..n_threads {
             let p_jdb = jdb.clone();
             let p_keys = keys.clone();
-            children.push(thread::spawn(move || {
+            children.push(spawn!(move || {
                 check_empty(t, n_threads, top, &p_jdb, &p_keys)
             }));
         }
@@ -325,7 +324,7 @@ mod test {
             assert!(child.join().is_ok());
         }
 
-        debug!("CLEAN UP");
+        debug!(&(), "CLEAN UP");
         assert!(jdb.close().is_ok());
     }
 }

@@ -1,8 +1,8 @@
 #![feature(async_iterator)]
-#![feature(noop_waker)]
 #![feature(test)]
 
 mod anvil_db;
+mod background;
 mod bloom_filter;
 mod checksum;
 mod common;
@@ -23,8 +23,8 @@ mod var_int;
 mod wal;
 
 // test only
-mod monday;
 mod test_util;
+mod tests;
 mod tuesday;
 mod wednesday;
 
@@ -40,7 +40,7 @@ use sst::block_cache::cache::LruBlockCache;
 use storage::blob_store::LocalBlobStore;
 
 type SuperSimpleContext = SimpleContext<LocalBlobStore, LruBlockCache, DefaultLogger>;
-type SuperSimpleAnvilScanner = AnvilDbScanner<SuperSimpleContext>;
+type SuperSimpleAnvilScanner<'a> = AnvilDbScanner<'a, SuperSimpleContext>;
 type SuperSimpleAnvilDb = AnvilDb<SuperSimpleContext>;
 
 #[derive(Debug)]
@@ -217,11 +217,11 @@ impl AnvilDB {
 }
 
 #[derive(Debug)]
-pub struct AnvilScanner {
-    inner: SuperSimpleAnvilScanner,
+pub struct AnvilScanner<'a> {
+    inner: SuperSimpleAnvilScanner<'a>,
 }
 
-impl AnvilScanner {
+impl AnvilScanner<'_> {
     pub fn from(mut self, key: &[u8]) -> Self {
         self.inner = self.inner.from(key);
         self
@@ -233,7 +233,7 @@ impl AnvilScanner {
     }
 }
 
-impl Iterator for AnvilScanner {
+impl Iterator for AnvilScanner<'_> {
     type Item = Result<(Vec<u8>, Vec<u8>), String>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -256,7 +256,7 @@ impl Iterator for AnvilScanner {
     }
 }
 
-impl AsyncIterator for AnvilScanner {
+impl AsyncIterator for AnvilScanner<'_> {
     type Item = Result<(Vec<u8>, Vec<u8>), String>;
 
     fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
