@@ -51,7 +51,7 @@ pub(crate) fn try_u64(val: usize) -> Result<u64, CastError> {
     match u64::try_from(val) {
         Ok(val) => Ok(val),
         Err(err) => Err(CastError {
-            message: format!("could not parse u64 from usize {}: {:?}", val, err),
+            message: format!("could not parse u64 from usize {val}: {err:?}",),
         }),
     }
 }
@@ -60,7 +60,7 @@ pub(crate) fn try_usize(val: u64) -> Result<usize, CastError> {
     match usize::try_from(val) {
         Ok(val) => Ok(val),
         Err(err) => Err(CastError {
-            message: format!("could not parse usize from u64 {}: {:?}", val, err),
+            message: format!("could not parse usize from u64 {val}: {err:?}",),
         }),
     }
 }
@@ -75,6 +75,8 @@ pub(crate) struct ResultPoller<T> {
 }
 
 impl<T> ResultPoller<T> {
+    // TODO(t/1581): Use me.
+    #[allow(dead_code)]
     pub(crate) fn new(receiver: Receiver<T>) -> Self {
         ResultPoller { receiver }
     }

@@ -27,13 +27,13 @@ pub(crate) enum BlobStoreError {
 
 impl BlobStoreError {
     pub(crate) fn wrap_read_error(err: std::io::Error) -> BlobStoreError {
-        BlobStoreError::ReadError(Some(format!("underlying storage error: {:?}", err)))
+        BlobStoreError::ReadError(Some(format!("underlying storage error: {err:?}",)))
     }
 }
 
 impl Display for BlobStoreError {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}",)
     }
 }
 
@@ -41,7 +41,7 @@ impl Error for BlobStoreError {}
 
 impl From<BlobStoreError> for String {
     fn from(value: BlobStoreError) -> Self {
-        format!("FileError: {:?}", value)
+        format!("FileError: {value:?}",)
     }
 }
 
@@ -128,14 +128,14 @@ pub(crate) trait WriteCursor {
     /// The write cursor can only append to the end of the file.
     /// It fill fail if the file has already been finalized.
     fn write(&mut self, buf: &[u8]) -> Result<(), BlobStoreError>;
-    fn finalize(self) -> Result<(), BlobStoreError>;
+    fn flush(&mut self) -> Result<(), BlobStoreError>;
 }
 
 /// BlobStore is a trait that allows for the creation, deletion, and reading of
 /// blobs. These blogs are typically files, but a blob name does not need to be
 /// a valid file path.
 /// Implementations of BlobStore must be thread safe.
-pub(crate) trait BlobStore: Clone + Send + Sync + 'static {
+pub(crate) trait BlobStore: Clone + std::fmt::Debug + Send + Sync + 'static {
     type ReadCursor: ReadCursor;
     type WriteCursor: WriteCursor;
     type BlobIter: Iterator<Item = String>;
@@ -148,6 +148,8 @@ pub(crate) trait BlobStore: Clone + Send + Sync + 'static {
     fn blob_iter(&self) -> Result<Self::BlobIter, BlobStoreError>;
     fn delete(&self, blob_id: &str) -> Result<(), BlobStoreError>;
 }
+
+#[derive(Debug)]
 struct InMemoryBlobData {
     blobs: HashMap<String, Vec<u8>>,
 }
@@ -223,8 +225,7 @@ impl ReadCursor for InMemoryReadCursor {
         let blob_len = blob.len();
         if offset > blob_len {
             return Err(BlobStoreError::ReadError(Some(format!(
-                "offset {:?} is greater than blob length {}",
-                offset, blob_len
+                "offset {offset:?} is greater than blob length {blob_len}",
             ))));
         }
         self.offset = blob_len - offset;
@@ -253,12 +254,12 @@ impl WriteCursor for InMemoryWriteCursor {
         Ok(())
     }
 
-    fn finalize(self) -> Result<(), BlobStoreError> {
+    fn flush(&mut self) -> Result<(), BlobStoreError> {
         Ok(())
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct InMemoryBlobStore {
     raw_data: Arc<Mutex<InMemoryBlobData>>,
 }
@@ -362,8 +363,7 @@ impl ReadCursor for LocalReadCursor {
             Ok(n) => n,
             Err(_) => {
                 return Err(BlobStoreError::ReadError(Some(format!(
-                    "offset {} cannot be converted to i64",
-                    offset
+                    "offset {offset} cannot be converted to i64",
                 ))));
             }
         };
@@ -378,8 +378,7 @@ impl ReadCursor for LocalReadCursor {
             Ok(n) => n,
             Err(_) => {
                 return Err(BlobStoreError::ReadError(Some(format!(
-                    "offset {} cannot be converted to i64",
-                    offset
+                    "offset {offset} cannot be converted to i64",
                 ))));
             }
         };
@@ -394,8 +393,7 @@ impl ReadCursor for LocalReadCursor {
             Ok(m) => m,
             Err(err) => {
                 return Err(BlobStoreError::ReadError(Some(format!(
-                    "could not get metadata: {:?}",
-                    err
+                    "could not get metadata: {err:?}",
                 ))));
             }
         };
@@ -415,13 +413,13 @@ impl LocalWriteCursor {
 
 impl WriteCursor for LocalWriteCursor {
     fn write(&mut self, buf: &[u8]) -> Result<(), BlobStoreError> {
-        match self.file.write(buf) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(BlobStoreError::WriteError(e)),
-        }
+        self.file
+            .write_all(buf)
+            .map_err(BlobStoreError::WriteError)?;
+        Ok(())
     }
 
-    fn finalize(self) -> Result<(), BlobStoreError> {
+    fn flush(&mut self) -> Result<(), BlobStoreError> {
         match self.file.sync_all() {
             Ok(_) => Ok(()),
             Err(err) => Err(BlobStoreError::WriteError(err)),
@@ -462,15 +460,13 @@ impl LocalBlobStore {
         for (i, c) in blob_name.chars().enumerate() {
             if i == 0 && c == '.' {
                 return Err(BlobStoreError::InvalidInput(format!(
-                    "blob name cannot start with a period: {}",
-                    blob_name
+                    "blob name cannot start with a period: {blob_name}",
                 )));
             }
             if (!c.is_alphanumeric()) && c != '.' && c != '-' && c != '_' {
                 return Err(BlobStoreError::InvalidInput(format!(
                     "blob name can only consist of alphanumeric characters or underscores, \
-                     hyphens, or periods: offending_char={} index={} blob_name={}",
-                    c, i, blob_name
+                     hyphens, or periods: offending_char={c} index={i} blob_name={blob_name}",
                 )));
             }
         }
@@ -552,19 +548,19 @@ mod test {
         let file_id = String::from("test_file");
         let mut wc = match fs.create_blob(&file_id) {
             Ok(c) => c,
-            Err(err) => panic!("failed to create file: {:?}", err),
+            Err(err) => panic!("failed to create file: {err:?}",),
         };
         let data = b"Hello, world!";
         if let Err(err) = wc.write(data) {
-            panic!("failed to write file: {:?}", err);
+            panic!("failed to write file: {err:?}",);
         }
-        if let Err(err) = wc.finalize() {
-            panic!("failed to finalize file: {:?}", err);
+        if let Err(err) = wc.flush() {
+            panic!("failed to finalize file: {err:?}",);
         }
 
         let mut rc = match fs.read_cursor(&file_id) {
             Ok(c) => c,
-            Err(err) => panic!("failed to read file: {:?}", err),
+            Err(err) => panic!("failed to read file: {err:?}",),
         };
         let mut buf = [0u8; 13];
         match rc.read(buf.as_mut()) {
@@ -572,10 +568,10 @@ mod test {
                 assert!(n == 13);
                 assert_eq!(data, &buf);
             }
-            Err(err) => panic!("failed to read file: {:?}", err),
+            Err(err) => panic!("failed to read file: {err:?}",),
         }
         if let Err(err) = fs.delete(&file_id) {
-            panic!("failed to delete file: {:?}", err);
+            panic!("failed to delete file: {err:?}",);
         }
         true
     }
@@ -593,7 +589,7 @@ mod test {
 
         let fc = match LocalBlobStore::new(&work_dir) {
             Ok(fc) => fc,
-            Err(err) => panic!("failed to create file store: {:?}", err),
+            Err(err) => panic!("failed to create file store: {err:?}",),
         };
         assert!(check_file_store(&fc));
         tear_down(&work_dir);

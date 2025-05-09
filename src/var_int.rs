@@ -2,7 +2,7 @@ use crate::{common::CastError, storage::blob_store::ReadCursor};
 
 /// Here lies a var_int_64 implementation, based on
 /// [Google's varint128 documentation](https://developers.google.com/protocol-buffers/docs/encoding#varints)
-
+///
 /// A structure to encapsulate a var_int_64.
 /// # Instance Variables
 /// - bytes: the bytes in the var_int_64
@@ -73,7 +73,7 @@ impl VarInt64 {
         loop {
             let mut buf = [0_u8];
             if let Err(err) = reader.read_exact(&mut buf) {
-                return Err(format!("{:?}", err));
+                return Err(format!("{err:?}",));
             }
             let byte = buf[0];
             my_bytes.push(byte);
@@ -121,7 +121,7 @@ impl TryFrom<usize> for VarInt64 {
     fn try_from(value: usize) -> Result<Self, Self::Error> {
         let value = match u64::try_from(value) {
             Ok(x) => x,
-            Err(err) => return Err(format!("could not convert usize {} to u64: {}", value, err))?,
+            Err(err) => return Err(format!("could not convert usize {value} to u64: {err}",))?,
         };
         VarInt64::try_from(value)
     }

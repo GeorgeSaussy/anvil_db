@@ -20,6 +20,7 @@ pub(crate) enum TaskCategory {
     MajorCompaction,
 }
 
+#[derive(Debug)]
 pub(crate) enum CompactOrder {
     Minor {
         minor_sst_readers: Vec<SstReader>,
@@ -99,7 +100,9 @@ impl CompactOrder {
 
 /// An SstStore instance is a thread safe wrapper that allows a user to read
 /// and write new SST files. It handles caching as well.
-pub(crate) trait TabletSstStore: Clone + TombstonePointReader + TryTombstoneScanner {
+pub(crate) trait TabletSstStore:
+    Clone + std::fmt::Debug + TombstonePointReader + TryTombstoneScanner
+{
     fn recover<B: BlobStore, S: ToString, I: Iterator<Item = S>>(
         blob_store: &B,
         levels: I,
@@ -114,10 +117,9 @@ pub(crate) trait TabletSstStore: Clone + TombstonePointReader + TryTombstoneScan
         original_order: &CompactOrder,
         new_readers: I,
     );
-    fn get_sst_reader(&self, blob_id: &str) -> Option<SstReader>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct SmartTablet {
     write_settings: SstWriteSettings,
     /// Minor sst files, from oldest to youngest.
@@ -139,6 +141,27 @@ pub(crate) struct SmartTablet {
     /// function on that SST. If it is not found during the iteration, then it
     /// is not present in the table.
     levels: Arc<Vec<RwLock<Vec<SstReader>>>>,
+}
+
+impl std::fmt::Debug for SmartTablet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let binding = self.minors.read().unwrap();
+        let minors = binding.iter().count();
+        let levels: Vec<_> = self
+            .levels
+            .iter()
+            .map(|level| {
+                let binding = level.read().unwrap();
+                binding.iter().count()
+                // .map(|r| r.blob_id_ref().to_string())
+                // .collect()
+            })
+            .collect();
+        f.debug_struct("SmartTablet")
+            .field("minors", &minors)
+            .field("levels", &levels.as_slice())
+            .finish()
+    }
 }
 
 const LEVEL_BLOW_UP_FACTOR: usize = 4;
@@ -383,21 +406,23 @@ impl TombstonePointReader for SmartTablet {
     }
 }
 
-pub(crate) type SmartTabletIterator<Ctx> = JoinedIter<
+pub(crate) type SmartTabletIterator<'a, Ctx> = JoinedIter<
     SstError,
-    MergedHomogenousIter<SstScanner<Ctx>>,
-    MergedHomogenousIter<MergedHomogenousIter<SstScanner<Ctx>>>,
+    MergedHomogenousIter<SstScanner<'a, Ctx>>,
+    MergedHomogenousIter<MergedHomogenousIter<SstScanner<'a, Ctx>>>,
 >;
 
 impl TryTombstoneScanner for SmartTablet {
     type Error = SstError;
-    type Iter<Ctx> = SmartTabletIterator<Ctx>
-        where Ctx: Context;
+    type Iter<'a, Ctx>
+        = SmartTabletIterator<'a, Ctx>
+    where
+        Ctx: Context + 'a;
 
-    fn try_scan<Ctx: Context>(
+    fn try_scan<'a, Ctx: Context>(
         &self,
-        storage_wrapper: &Ctx,
-    ) -> Result<Self::Iter<Ctx>, Self::Error> {
+        storage_wrapper: &'a Ctx,
+    ) -> Result<Self::Iter<'a, Ctx>, Self::Error> {
         let (minors, levels) = self.sst_snapshot();
         let minor_iters = minors
             .into_iter()
@@ -406,6 +431,7 @@ impl TryTombstoneScanner for SmartTablet {
         let minor_iter = MergedHomogenousIter::new(minor_iters.into_iter());
         let level_scanners: Vec<_> = levels
             .into_iter()
+            .rev()
             .map(|level| {
                 level
                     .into_iter()
@@ -505,47 +531,51 @@ impl TabletSstStore for SmartTablet {
     fn add_minor_sst(&self, sst_reader: SstReader) {
         self.minors.write().unwrap().push(sst_reader);
     }
-
-    fn get_sst_reader(&self, blob_id: &str) -> Option<SstReader> {
-        let levels = self.minors.read().unwrap().clone();
-        levels
-            .into_iter()
-            .find(|level| level.blob_id_ref() == blob_id)
-    }
 }
 
 #[cfg(test)]
 mod test {
 
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU32;
     use std::sync::mpsc::channel;
-    use std::thread::spawn;
+    use std::time::Duration;
 
     use super::*;
     use crate::compactor::Compactor;
-    use crate::compactor::CompactorMessage;
     use crate::compactor::CompactorSettings;
     use crate::context::SimpleContext;
-    use crate::helpful_macros::clone;
-    use crate::helpful_macros::unwrap;
+    use crate::helpful_macros::{clone, spawn, unwrap};
     use crate::kv::TombstonePair;
     use crate::logging::debug;
+    use crate::logging::error;
+    use crate::logging::info;
+    use crate::logging::ArchiveLogger;
     use crate::logging::DefaultLogger;
+    use crate::logging::FixPrefixLogger;
+    use crate::logging::Logger;
     use crate::sst::block_cache::cache::LruCache;
     use crate::sst::block_cache::cache::PolicyHolder;
     use crate::sst::block_cache::BlockCache;
     use crate::storage::blob_store::InMemoryBlobStore;
 
-    type SuperSimpleContext =
-        SimpleContext<InMemoryBlobStore, PolicyHolder<LruCache>, DefaultLogger>;
+    type SuperSimpleContext<L> = SimpleContext<InMemoryBlobStore, PolicyHolder<LruCache>, L>;
 
     fn new_test_sst_store(
         compactor_tx: Option<Sender<CompactorMessage>>,
-    ) -> (SuperSimpleContext, SmartTablet) {
+    ) -> (SuperSimpleContext<DefaultLogger>, SmartTablet) {
+        let logger = DefaultLogger::default();
+        make_sst_store_from_logger(compactor_tx, logger)
+    }
+    fn make_sst_store_from_logger<L: Logger>(
+        compactor_tx: Option<Sender<CompactorMessage>>,
+        logger: L,
+    ) -> (SuperSimpleContext<L>, SmartTablet) {
         let blob_store = InMemoryBlobStore::new();
         let ctx = SimpleContext::from((
             blob_store,
             PolicyHolder::<LruCache>::with_capacity(32),
-            DefaultLogger::default(),
+            logger,
         ));
         let levels: Vec<String> = Vec::new();
         if let Some(compactor_tx) = compactor_tx {
@@ -555,9 +585,9 @@ mod test {
             );
         }
         let (compactor_tx, compactor_rx) = channel();
-        spawn(move || {
+        spawn!(move || {
             while let Ok(message) = compactor_rx.recv() {
-                debug!("message: {:?}", message);
+                debug!(&(), "message: {:?}", message);
             }
         });
         (
@@ -571,8 +601,8 @@ mod test {
         sst_store: T,
         pairs: I,
     ) {
-        let mut compactor = Compactor::one_off(clone!(ctx), sst_store);
-        unwrap!(compactor.minor_compact(pairs));
+        let mut compactor = Compactor::one_off(sst_store);
+        unwrap!(compactor.minor_compact(ctx, pairs));
     }
 
     #[test]
@@ -599,9 +629,7 @@ mod test {
             if i % 2 == 0 {
                 assert!(
                     value.as_ref().is_some(),
-                    "could find read value at key {:?}; index {}",
-                    key_bytes,
-                    i
+                    "could find read value at key {key_bytes:?}; index {i}",
                 );
                 assert_eq!(*value.as_ref().unwrap(), (i * i).to_be_bytes().to_vec());
             } else {
@@ -771,95 +799,218 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_level_updates_are_atomic() {
+    fn level_updates_are_atomic_inner(thread_id: usize) -> Result<(), ArchiveLogger> {
         // Time to beat is 8 sec with top = 1024 ** 2 / 8
+        let logger = ArchiveLogger::new(&format!("lg-{thread_id}"));
+
         let top = 1024 * 1024 / 8;
         let n_partitions = 32;
         let n_scanners = 8;
 
+        info!(
+            &logger,
+            "running level_updates_are_atomic_inner thread_id: thread_id = {thread_id} ; top = \
+             {top} ; n_partitions = {n_partitions} ; n_scanners = {n_scanners}"
+        );
+
         let (compactor_tx, compactor_rx) = channel();
-        let (ctx, sst_store) = new_test_sst_store(Some(compactor_tx.clone()));
+        let (ctx, sst_store) =
+            make_sst_store_from_logger(Some(compactor_tx.clone()), logger.clone());
+
+        info!(&logger, "made ctx, sst_store, and compactor_tx");
 
         let compactor = Compactor::new(
-            ctx.clone(),
             sst_store.clone(),
             CompactorSettings::default(),
             compactor_tx.clone(),
             compactor_rx,
+            0,
         );
-        spawn(move || compactor.run());
+        let bg_ctx = clone!(ctx);
+        {
+            let logger = logger.clone();
+            spawn!(move || {
+                info!(&logger, "starting compactor thread");
+                compactor.run(&bg_ctx)
+            });
+        }
+
+        info!(&logger, "compactor running in separate thread");
 
         let test_values = complex_test_values(top);
         for (batch, (wal_values, raw_expected_values)) in
             test_values.into_iter().enumerate().take(3)
         {
+            info!(&logger, "setting up batch number: {batch}");
             let mut seen_values = HashSet::new();
             for r in 0..n_partitions {
-                let pairs = wal_values.iter().skip(r).step_by(n_partitions).cloned();
+                info!(
+                    &logger,
+                    "running minor compaction for partition number {r} in batch number {batch}"
+                );
+                let pairs: std::iter::Cloned<
+                    std::iter::StepBy<std::iter::Skip<std::slice::Iter<'_, TombstonePair>>>,
+                > = wal_values.iter().skip(r).step_by(n_partitions).cloned();
                 run_minor_compaction(&ctx, sst_store.clone(), pairs.clone());
                 for pair in pairs {
                     seen_values.insert(pair.key_ref().to_vec());
                 }
             }
             for wal_value in wal_values.iter() {
-                assert!(seen_values.contains(wal_value.key_ref()));
+                if !seen_values.contains(wal_value.key_ref()) {
+                    error!(
+                        &logger,
+                        "wal value missing: batch_no = {batch} ; key = {key:?}",
+                        key = wal_value.key_ref()
+                    );
+                    return Err(logger.clone());
+                }
             }
-            assert_eq!(seen_values.len(), wal_values.len());
+            if seen_values.len() != wal_values.len() {
+                error!(
+                    &logger,
+                    "seen values: {seen_values:?} ; wal values: {wal_values:?}"
+                );
+                return Err(logger.clone());
+            }
             let expected_values = raw_expected_values
                 .into_iter()
                 .enumerate()
                 .filter_map(|(i, v)| {
-                    v.as_ref()?;
                     let key_bytes = i.to_be_bytes().to_vec();
-                    let value = v.unwrap();
+                    let value = v.as_ref()?.as_ref()?.clone();
                     Some((key_bytes, value))
                 })
-                .collect::<Vec<(Vec<u8>, TombstoneValue)>>();
+                .collect::<Vec<(Vec<u8>, Vec<u8>)>>();
+            let logger = logger.clone();
+            let num_errors = Arc::new(AtomicU32::new(0));
+            std::thread::sleep(Duration::from_millis(5000));
+            // let p_expected_values: Vec<_> = expected_values
+            //     .clone()
+            //     .into_iter()
+            //     .filter_map(|(key, value)| value.as_ref().map(|value| (key,
+            // value.clone())))     .collect();
+            std::thread::scope(|s| {
+                let mut children = Vec::with_capacity(n_scanners);
+                for sub_thread_id in 0..n_scanners {
+                    let sst_store = sst_store.clone();
+                    let ctx = ctx.clone();
+                    let p_expected_values = expected_values.clone();
+                    let logger = logger.clone();
+                    let num_errors = num_errors.clone();
+                    children.push(s.spawn(move || {
+                        let iter = sst_store.try_scan(&ctx).unwrap();
+                        info!(
+                            &logger,
+                            "starting thread_id: {thread_id}-{sub_thread_id}, batch: {batch}"
+                        );
+                        let real_pairs: Vec<_> = iter
+                            .map(|result| match result {
+                                Ok(ok) => ok,
+                                Err(err) => {
+                                    panic!("Error scanning: {err:?}",);
+                                }
+                            })
+                            .filter_map(|pair| {
+                                pair.value_ref()
+                                    .as_ref()
+                                    .map(|value| (pair.key_ref().to_vec(), value.clone()))
+                            })
+                            .collect();
+                        for (idx, (found_key, found_value)) in real_pairs.iter().enumerate() {
+                            let (expected_key, expected_value) = p_expected_values[idx].clone();
 
-            let mut children = Vec::with_capacity(n_scanners);
-            for thread_id in 0..n_scanners {
-                let iter = sst_store.try_scan(&ctx).unwrap();
-                let p_expected_values: Vec<_> = expected_values
-                    .clone()
-                    .into_iter()
-                    .filter_map(|(key, value)| value.as_ref().map(|value| (key, value.clone())))
-                    .collect();
-                children.push(spawn(move || {
-                    let real_pairs = iter
-                        .map(|result| match result {
-                            Ok(ok) => ok,
-                            Err(err) => {
-                                panic!("Error scanning: {:?}", err);
+                            if *found_key != expected_key {
+                                error!(
+                                    &logger,
+                                    "found_key: {found_key:?}\nexpected_key: {expected_key:?}\n \
+                                     thread_id: {thread_id}-{sub_thread_id}, idx: {idx}, batch: \
+                                     {batch}",
+                                );
+                                num_errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                return;
                             }
-                        })
-                        .filter_map(|pair| {
-                            pair.value_ref()
-                                .as_ref()
-                                .map(|value| (pair.key_ref().to_vec(), value.clone()))
-                        });
-                    for (idx, (found_key, found_value)) in real_pairs.enumerate() {
-                        let (expected_key, expected_value) = p_expected_values[idx].clone();
-                        assert_eq!(
-                            found_key, expected_key,
-                            "thread_id: {}, idx: {}, batch: {}",
-                            thread_id, idx, batch
+
+                            if *found_value != expected_value {
+                                error!(
+                                    &logger,
+                                    "found_key: {found_key:?}\nexpected_key: {expected_key:?}\n \
+                                     found_value: {found_value:?}\nexpected_value: \
+                                     {expected_value:?}\nthread_id: {thread_id}-{sub_thread_id}, \
+                                     idx: {idx}, batch: {batch}",
+                                );
+                                num_errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                return;
+                            }
+                        }
+                        info!(
+                            &logger,
+                            "ending thread_id: {thread_id}-{sub_thread_id}, batch: {batch}"
                         );
-                        assert_eq!(
-                            found_value, expected_value,
-                            "thread_id: {}, idx: {}, batch: {}",
-                            thread_id, idx, batch
-                        );
-                    }
-                }));
-            }
-            for child in children {
-                if let Err(err) = child.join() {
-                    panic!("Error joining thread: {:?}", err);
+                    }));
                 }
+                for (sub_thread_id, child) in children.into_iter().enumerate() {
+                    if child.join().is_err() {
+                        error!(
+                            &logger,
+                            "Error joining thread_id: {thread_id}-{sub_thread_id}, batch: {batch}"
+                        );
+                        num_errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        return;
+                    }
+                }
+            });
+            if num_errors.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                error!(
+                    &logger,
+                    "thread_id: {thread_id}, batch: {batch}, num_errors: {}",
+                    num_errors.load(std::sync::atomic::Ordering::SeqCst)
+                );
+                return Err(logger.clone());
             }
         }
 
-        compactor_tx.send(CompactorMessage::Shutdown).unwrap();
+        if let Err(err) = compactor_tx.send(CompactorMessage::Shutdown) {
+            error!(
+                &logger,
+                "Error sending shutdown message to compactor: {err:?}",
+            );
+            return Err(logger.clone());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_level_updates_are_atomic() {
+        let top = 4;
+        let start = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::with_capacity(top);
+        let (logger_tx, logger_rx) = channel();
+        for thread_id in 0..top {
+            let start = start.clone();
+            let logger_tx = logger_tx.clone();
+            handles.push(spawn!(move || {
+                while !start.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                let _ = logger_tx.send(level_updates_are_atomic_inner(thread_id));
+            }));
+        }
+        start.store(true, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..top {
+            let result = unwrap!(logger_rx.recv());
+            if let Err(logger) = result {
+                let inner = FixPrefixLogger::new("[HISTORY]");
+                for line in logger.history_ref() {
+                    debug!(&inner, "{line}");
+                }
+                panic!();
+            }
+        }
+        for handle in handles {
+            if let Err(err) = handle.join() {
+                panic!("Error joining thread: {err:?}",);
+            }
+        }
     }
 }

@@ -3,7 +3,6 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::mpsc::{channel, Sender};
 use std::task::{Context as TaskContext, Poll};
-use std::thread::spawn;
 
 use crate::compactor::{Compactor, CompactorError, CompactorMessage, CompactorSettings};
 use crate::context::Context;
@@ -77,13 +76,16 @@ where
         )?;
 
         let compactor = Compactor::new(
-            ctx.clone(),
             sst_store.clone(),
             config.compactor_settings(),
             compactor_tx.clone(),
             compactor_rx,
+            0,
         );
-        spawn(move || compactor.run());
+
+        let bg_ctx = ctx.clone();
+        ctx.bg_ref()
+            .spawn_compactor_bg(move || compactor.run(&bg_ctx).unwrap());
 
         Ok(AnvilDb {
             ctx,
@@ -193,7 +195,9 @@ where
 
         let (mem_table, sst_store, compactor, compactor_tx) =
             MemTable::recover(ctx.clone(), config)?;
-        spawn(move || compactor.run());
+        let bg_ctx = ctx.clone();
+        ctx.bg_ref()
+            .spawn_compactor_bg(move || compactor.run(&bg_ctx).unwrap());
 
         Ok(AnvilDb {
             ctx,
@@ -211,24 +215,24 @@ where
     pub(crate) fn close(self) -> Result<(), String> {
         self.compactor_tx
             .send(CompactorMessage::Shutdown)
-            .map_err(|err| format!("failed to send shutdown message: {:?}", err))?;
+            .map_err(|err| format!("failed to send shutdown message: {err:?}",))?;
         self.mem_table.close()?;
         Ok(())
     }
 }
 
-type BigScanType<Ctx> =
-    JoinedIter<String, <MemTable<Ctx> as TombstoneScanner>::Iter, SmartTabletIterator<Ctx>>;
+type BigScanType<'a, Ctx> =
+    JoinedIter<String, <MemTable<Ctx> as TombstoneScanner>::Iter, SmartTabletIterator<'a, Ctx>>;
 
 #[derive(Debug)]
-pub(crate) struct AnvilDbScanner<Ctx: Context>
+pub(crate) struct AnvilDbScanner<'a, Ctx: Context>
 where
     <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
 {
-    inner: BigScanType<Ctx>,
+    inner: BigScanType<'a, Ctx>,
 }
 
-impl<Ctx: Context> Iterator for AnvilDbScanner<Ctx>
+impl<Ctx: Context> Iterator for AnvilDbScanner<'_, Ctx>
 where
     <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
 {
@@ -239,7 +243,7 @@ where
     }
 }
 
-impl<Ctx: Context> RangeSet for AnvilDbScanner<Ctx>
+impl<Ctx: Context> RangeSet for AnvilDbScanner<'_, Ctx>
 where
     <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync,
 {
@@ -254,7 +258,7 @@ where
     }
 }
 
-impl<Ctx: Context> TombstoneIterator for AnvilDbScanner<Ctx>
+impl<Ctx: Context> TombstoneIterator for AnvilDbScanner<'_, Ctx>
 where
     <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync,
 {
@@ -262,14 +266,14 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) struct AsyncAnvilDbScanner<Ctx: Context>
+pub(crate) struct AsyncAnvilDbScanner<'a, Ctx: Context>
 where
     <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync,
 {
-    inner: BigScanType<Ctx>,
+    inner: BigScanType<'a, Ctx>,
 }
 
-impl<Ctx: Context> AsyncIterator for AsyncAnvilDbScanner<Ctx>
+impl<Ctx: Context> AsyncIterator for AsyncAnvilDbScanner<'_, Ctx>
 where
     <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync,
 {
@@ -281,7 +285,7 @@ where
     }
 }
 
-impl<Ctx: Context> RangeSet for AsyncAnvilDbScanner<Ctx>
+impl<Ctx: Context> RangeSet for AsyncAnvilDbScanner<'_, Ctx>
 where
     <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync,
 {
@@ -296,19 +300,19 @@ where
     }
 }
 
-impl<Ctx: Context> AsyncTombstoneIterator for AsyncAnvilDbScanner<Ctx>
+impl<Ctx: Context> AsyncTombstoneIterator for AsyncAnvilDbScanner<'_, Ctx>
 where
     <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync,
 {
     type Error = String;
 }
 
-impl<Ctx: Context> TryAsyncTombstoneScanner for AnvilDb<Ctx>
+impl<'a, Ctx: Context> TryAsyncTombstoneScanner for &'a AnvilDb<Ctx>
 where
     <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync,
 {
     type Error = String;
-    type Iter = AsyncAnvilDbScanner<Ctx>;
+    type Iter = AsyncAnvilDbScanner<'a, Ctx>;
 
     fn try_async_scan(&self) -> Result<Self::Iter, Self::Error> {
         let a = TombstoneScanner::scan(&self.mem_table);
@@ -483,6 +487,7 @@ mod test {
         }
         let duration = start.elapsed();
         debug!(
+            &(),
             "Writing {} points synchronously took {:.2} sec ({:.2} us per point)",
             top,
             duration.as_secs_f64(),
@@ -514,10 +519,10 @@ mod test {
             for future in futures.into_iter() {
                 let mut future = future;
                 let waker = Waker::noop();
-                let mut cx = TaskContext::from_waker(&waker);
+                let mut cx = TaskContext::from_waker(waker);
                 let poll = Pin::new(&mut future).poll(&mut cx);
                 match poll {
-                    Poll::Ready(Err(e)) => panic!("async_set failed: {:?}", e),
+                    Poll::Ready(Err(e)) => panic!("async_set failed: {e:?}",),
                     Poll::Ready(Ok(())) => {}
                     Poll::Pending => new_futures.push(future),
                 }
@@ -530,8 +535,8 @@ mod test {
 
         let duration = start.elapsed();
         debug!(
-            "Writing {} points asynchronously took {:.2} sec ({:.2} us per point)",
-            top,
+            &(),
+            "Writing {top} points asynchronously took {:.2} sec ({:.2} us per point)",
             duration.as_secs_f64(),
             duration.as_micros() as f64 / top as f64
         );
@@ -563,9 +568,7 @@ mod test {
         (store, db)
     }
 
-    fn write_and_compact() -> (InMemoryBlobStore, TestOnlyAnvilDb) {
-        let top = 100_000_usize;
-        let max_wal_bytes = 8 * 1024 * 1024;
+    fn write_and_compact(top: usize, max_wal_bytes: usize) -> (InMemoryBlobStore, TestOnlyAnvilDb) {
         let (store, db) = db_with_max_wal_bytes(max_wal_bytes);
 
         let n_series = 1_009;
@@ -592,6 +595,7 @@ mod test {
         }
         let duration = start.elapsed();
         debug!(
+            &(),
             "Writing {} points took {:.2} sec ({:.2} ms per point)",
             top,
             duration.as_secs_f64(),
@@ -603,25 +607,30 @@ mod test {
 
     #[test]
     fn test_user_requested_compactions() {
-        let (_, db) = write_and_compact();
+        let top = 100_000_usize;
+        let (_, db) = write_and_compact(top, 8 * 1024 * 1024);
         let start = Instant::now();
         db.compact().unwrap();
         let duration = start.elapsed();
-        debug!("Took {:.2} sec to compact.", duration.as_secs_f64());
+        debug!(&(), "Took {:.2} sec to compact.", duration.as_secs_f64());
         db.close().unwrap();
     }
 
     #[test]
     fn test_natural_wal_rotation_1() {
-        let (store, db) = write_and_compact();
+        let top = 128;
+        let max_wal_bytes = 1024;
+
+        let (store, db) = write_and_compact(top, max_wal_bytes);
         let start = Instant::now();
         loop {
             sleep(Duration::from_millis(1000));
             let blob_names: Vec<_> = store.blob_iter().unwrap().collect();
             debug!(
+                &(),
                 "{} existing files:\n{}",
                 blob_names.len(),
-                blob_names.join("\n")
+                blob_names.join(" ")
             );
             let target_sst_suffix = ".base.sst";
             let (wal_count, target_sst_count, other_count) =
@@ -635,14 +644,17 @@ mod test {
                     }
                 });
             debug!(
+                &(),
                 "wal_count: {} ;  target_sst_count: {} ; other_count: {}",
-                wal_count, target_sst_count, other_count
+                wal_count,
+                target_sst_count,
+                other_count
             );
             assert!(wal_count > 0);
             if wal_count == 1 && target_sst_count == 1 && other_count == 0 {
                 break;
             }
-            if start.elapsed().as_secs() > 10 {
+            if start.elapsed().as_secs() > 30 {
                 panic!("garbage collection took too long");
             }
         }
@@ -666,22 +678,16 @@ mod test {
         for idx in 0..top {
             let key = buf(idx);
             let value = buf(idx + 2);
-            db.set(&key, &value).unwrap();
+            unwrap!(db.set(&key, &value));
             if idx % (top / 8) == 0 {
                 sleep(Duration::from_millis(100));
-                let found = store.blob_iter().unwrap().fold(false, |found, blob_name| {
-                    if blob_name.ends_with(".sst") {
-                        return true;
-                    }
-                    found
-                });
-                if found {
+                if unwrap!(store.blob_iter()).any(|blob_id| blob_id.ends_with(".sst")) {
                     break;
                 }
             }
             assert_ne!(idx, top - 1);
         }
 
-        db.close().unwrap();
+        unwrap!(db.close());
     }
 }

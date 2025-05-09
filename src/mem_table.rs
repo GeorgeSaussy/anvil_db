@@ -1,12 +1,12 @@
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::sync::mpsc::{channel, Sender};
-use std::thread::spawn;
 
 use crate::anvil_db::AnvilDbConfig;
 use crate::compactor::{Compactor, CompactorError, CompactorMessage};
 use crate::concurrent_skip_list::{ConcurrentSkipListPairView, ConcurrentSkipListScanner};
 use crate::context::Context;
+use crate::helpful_macros::raw_spawn;
 use crate::kv::{
     MergedHomogenousIter, TombstonePairLike, TombstonePointReader, TombstoneScanner,
     TombstoneStore, TombstoneValueLike,
@@ -29,9 +29,9 @@ pub(crate) enum MemTableError {
 impl Display for MemTableError {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
-            MemTableError::Compactor(err) => write!(f, "CompactorError: {:?}", err),
-            MemTableError::Sst(err) => write!(f, "SstError: {:?}", err),
-            MemTableError::Wal(err) => write!(f, "WalError: {:?}", err),
+            MemTableError::Compactor(err) => write!(f, "CompactorError: {err:?}",),
+            MemTableError::Sst(err) => write!(f, "SstError: {err:?}",),
+            MemTableError::Wal(err) => write!(f, "WalError: {err:?}",),
         }
     }
 }
@@ -58,7 +58,7 @@ impl From<CompactorError> for MemTableError {
 
 impl From<MemTableError> for String {
     fn from(value: MemTableError) -> Self {
-        format!("MemTableError: {:?}", value)
+        format!("MemTableError: {value:?}",)
     }
 }
 
@@ -69,16 +69,11 @@ impl From<MemTableError> for String {
 #[derive(Clone, Debug)]
 pub(crate) struct MemTable<Ctx: Context> {
     ctx: Ctx,
-    mem_queue: MemQueue<Ctx>,
+    mem_queue: MemQueue<<Ctx as Context>::BlobStore>,
     compactor_tx: Sender<CompactorMessage>,
 }
 
-type RecoveryData<Ctx, T> = (
-    MemTable<Ctx>,
-    T,
-    Compactor<Ctx, T>,
-    Sender<CompactorMessage>,
-);
+type RecoveryData<Ctx, T> = (MemTable<Ctx>, T, Compactor<T>, Sender<CompactorMessage>);
 
 impl<Ctx: Context + Send + 'static> MemTable<Ctx>
 where
@@ -101,7 +96,7 @@ where
     ) -> Result<MemTable<Ctx>, MemTableError> {
         Ok(MemTable {
             ctx: ctx.clone(),
-            mem_queue: MemQueue::new(ctx.clone(), wal_config)?,
+            mem_queue: MemQueue::new(ctx.blob_store_ref().clone(), wal_config)?,
             compactor_tx,
         })
     }
@@ -126,8 +121,11 @@ where
         let (wal_wrapper, recovery_data) = recovery;
 
         let (compactor_tx, compactor_rx) = channel();
-        let mem_queue =
-            MemQueue::from_recovery(ctx.clone(), wal_wrapper, recovery_data.next_wal_id());
+        let mem_queue = MemQueue::from_recovery(
+            ctx.blob_store_ref().clone(),
+            wal_wrapper,
+            recovery_data.next_wal_id(),
+        );
 
         let manifest_levels: Vec<String> = recovery_data
             .manifest_ref()
@@ -141,15 +139,27 @@ where
         )?;
 
         let mut compactor = Compactor::new(
-            ctx.clone(),
             sst_store.clone(),
             config.compactor_settings(),
             compactor_tx.clone(),
             compactor_rx,
+            0,
         );
         for x in recovery_data.un_compacted_updates_ref() {
-            let sst_blob_id = compactor.minor_compact(x.1.clone().into_iter())?;
-            mem_queue.mark_minor_compaction(&x.0, &sst_blob_id)?;
+            let wal_blob_id = x.0.clone();
+            let result = compactor.minor_compact(&ctx, x.1.clone().into_iter());
+            let sst_blob_id = match result {
+                Ok(blob_id) => blob_id,
+                Err(err) => {
+                    if let CompactorError::NothingToCompact = err {
+                        info!(ctx.logger(), "skipping empty WAL {:?}", wal_blob_id);
+                        continue;
+                    } else {
+                        return Err(err.into());
+                    }
+                }
+            };
+            mem_queue.mark_minor_compaction(&wal_blob_id, &sst_blob_id)?;
         }
 
         // TODO(t/1336): Here we send garbage collection to the newly created compactor
@@ -182,22 +192,15 @@ where
         key: &[u8],
         value: &T,
     ) -> Result<(), <Self as TombstoneStore>::E> {
-        if let Err(err) = self.mem_queue.async_set(key, value).await {
-            match err {
-                // the WAL is full, rotate in the background and return ok
-                WalError::RotationRequired => {
-                    self.background_rotate();
-                    return Ok(());
-                }
-                // otherwise return the error
-                _ => return Err(err.into()),
-            }
+        let rotation_required = self.mem_queue.async_set(key, value).await?;
+        if rotation_required {
+            self.background_rotate();
         }
         Ok(())
     }
 
     pub(crate) fn rotate(&self) -> Result<(), MemTableError> {
-        let (old_wal_blob_id, arc, iter) = self.mem_queue.rotate()?;
+        let (old_wal_blob_id, iter) = self.mem_queue.rotate()?;
         let (done_tx, done_rx) = channel();
         self.compactor_tx
             .send(CompactorMessage::MinorCompact {
@@ -223,7 +226,7 @@ where
         }
         let (done_tx, done_rx) = channel();
         let done_tx = Some(done_tx);
-        self.mem_queue.maybe_drop_arc(arc);
+        self.mem_queue.drop_wal_id(&old_wal_blob_id)?;
         self.compactor_tx
             .send(CompactorMessage::GarbageCollect {
                 blob_ids: vec![old_wal_blob_id],
@@ -236,8 +239,8 @@ where
 
     fn background_rotate(&self) {
         let mem_table = self.clone();
-        // TODO(t/1336): This should spawn to an async thread.
-        spawn(move || {
+        // TODO(t/1673): This should be handled by the compactor.
+        raw_spawn!(move || {
             info!(mem_table.ctx.logger(), "rotating wal in the background");
             if let Err(err) = mem_table.rotate() {
                 error!(mem_table.ctx.logger(), "error rotating wal: {:?}", err);
@@ -250,7 +253,7 @@ where
     /// # Returns
     ///
     /// An error if the MemTable could not be closed cleanly.
-    pub(crate) fn close(self) -> Result<(), MemTableError> {
+    pub(crate) fn close(mut self) -> Result<(), MemTableError> {
         self.mem_queue.close()
     }
 }
@@ -326,23 +329,17 @@ where
         key: &[u8],
         value: &T,
     ) -> Result<(), <Self as TombstoneStore>::E> {
-        if let Err(err) = self.mem_queue.set(key, value) {
-            match err {
-                // the WAL is full, rotate in the background and return ok
-                WalError::RotationRequired => {
-                    let my_self = self.clone();
-                    // TODO(t/1395): This should be handled by the ECS-like system.
-                    spawn(move || {
-                        info!(my_self.ctx.logger(), "rotating wal in the background");
-                        if let Err(err) = my_self.rotate() {
-                            error!(my_self.ctx.logger(), "error rotating wal: {:?}", err);
-                        }
-                    });
-                    return Ok(());
+        let rotation_required = self.mem_queue.set(key, value)?;
+        if rotation_required {
+            let my_self = self.clone();
+            // TODO(t/1673): This should be handled by the compactor.
+            raw_spawn!(move || {
+                info!(my_self.ctx.logger(), "rotating wal in the background");
+                if let Err(err) = my_self.rotate() {
+                    error!(my_self.ctx.logger(), "error rotating wal: {:?}", err);
                 }
-                // otherwise return the error
-                _ => return Err(err.into()),
-            }
+            });
+            return Ok(());
         }
         Ok(())
     }
@@ -353,15 +350,13 @@ mod test {
     use std::cmp::Ordering;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::mpsc::channel;
     use std::task::{Context as TaskContext, Poll, Waker};
-    use std::thread::spawn;
     use std::time::Instant;
 
     use super::*;
-    use crate::compactor::{CompactorMessage, CompactorSettings};
-    use crate::context::{Context, SimpleContext};
-    use crate::helpful_macros::{clone, unwrap};
+    use crate::compactor::CompactorSettings;
+    use crate::context::SimpleContext;
+    use crate::helpful_macros::{clone, spawn, unwrap};
     use crate::kv::TryTombstoneScanner;
     use crate::logging::DefaultLogger;
     use crate::sst::block_cache::cache::LruBlockCache;
@@ -569,11 +564,11 @@ mod test {
             compactor_tx.clone(),
         ));
         let compactor = Compactor::new(
-            clone!(ctx),
             sst_store.clone(),
             CompactorSettings::default(),
             compactor_tx.clone(),
             compactor_rx,
+            0,
         );
 
         let mc = unwrap!(MemTable::new(
@@ -617,7 +612,8 @@ mod test {
 
         // RUN MINOR COMPACTION
 
-        spawn(move || compactor.run());
+        let bg_ctx = clone!(ctx);
+        spawn!(move || compactor.run(&bg_ctx));
         unwrap!(mc.rotate());
 
         // SCAN SST_STORE
@@ -681,7 +677,7 @@ mod test {
             loop {
                 let poller = Pin::new(&mut poller);
                 let waker = Waker::noop();
-                let context = &mut TaskContext::from_waker(&waker);
+                let context = &mut TaskContext::from_waker(waker);
                 if let Poll::Ready(result) = poller.poll(context) {
                     assert!(result.is_ok());
                     break;

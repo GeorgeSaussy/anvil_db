@@ -3,92 +3,122 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
 
 use crate::concurrent_skip_list::{ConcurrentSkipList, ConcurrentSkipListScanner};
-use crate::context::Context;
+use crate::helpful_macros::unlock;
 use crate::kv::{
     MergedHomogenousIter, RangeSet, TombstoneIterator, TombstonePair, TombstoneValue,
     TombstoneValueLike,
 };
 use crate::mem_table::MemTableError;
-use crate::storage::blob_store::BlobStore;
+use crate::storage::blob_store::{BlobStore, WriteCursor};
 use crate::wal::wal_entry::WalError;
 use crate::wal::wal_wrapper::{WalWrapper, WalWrapperConfig};
 
 type WalBlobId = String;
 type WrapData = (
     WalBlobId,
-    Arc<RwLock<MemQueueEntry>>,
     ConcurrentSkipListScanner<Vec<u8>, TombstoneValue>,
 );
 
-#[derive(Clone, Debug)]
-pub(crate) struct MemQueueEntry {
+#[derive(Debug)]
+pub(crate) struct MemQueueEntry<WC> {
     skip_list: ConcurrentSkipList<Vec<u8>, TombstoneValue>,
-    wal: WalWrapper,
-    next: Option<Arc<RwLock<MemQueueEntry>>>,
+    wal: WalWrapper<WC>,
+    next: Option<Box<MemQueueEntry<WC>>>,
     compacted: bool,
     finalized: bool,
 }
 
-impl MemQueueEntry {
-    pub(crate) fn wrap<B: BlobStore>(
+impl<WC: WriteCursor> MemQueueEntry<WC> {
+    pub(crate) fn wrap<B: BlobStore<WriteCursor = WC>>(
+        &mut self,
         blob_store: &B,
-        id: usize,
-        wal_config: WalWrapperConfig,
-        other: MemQueueEntry,
-    ) -> Result<(MemQueueEntry, WrapData), MemTableError>
+        wal_id_itr: &AtomicUsize,
+        wal_config: &WalWrapperConfig,
+    ) -> Result<WrapData, MemTableError>
     where
         B::WriteCursor: Send + Sync + 'static,
     {
-        let wal_blob_id = other.wal.blob_id_ref().to_string();
-        other.wal.clone().close()?;
-        let iter = other.skip_list.iter();
-        let next = Arc::new(RwLock::new(other));
-        Ok((
-            MemQueueEntry {
-                skip_list: ConcurrentSkipList::new(),
-                wal: WalWrapper::new(blob_store, wal_config.with_next_wal_id(id))?,
-                next: Some(next.clone()),
-                compacted: false,
-                finalized: false,
-            },
-            (wal_blob_id, next, iter),
-        ))
+        self.wal.flush()?;
+        let old_blob_id = self.wal.blob_id_ref().to_string();
+        let old_iter = self.skip_list.iter();
+
+        let mut skip_list = ConcurrentSkipList::new();
+        std::mem::swap(&mut self.skip_list, &mut skip_list);
+        let id = wal_id_itr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut wal = WalWrapper::new(blob_store, id, wal_config.clone())?;
+        std::mem::swap(&mut self.wal, &mut wal);
+        let mut next = None;
+        std::mem::swap(&mut self.next, &mut next);
+        let compacted = self.compacted;
+        let finalized = self.finalized;
+        self.compacted = false;
+        self.finalized = false;
+        let other = Box::new(MemQueueEntry {
+            skip_list,
+            wal,
+            next,
+            compacted,
+            finalized,
+        });
+        self.next = Some(other);
+        Ok((old_blob_id, old_iter))
+    }
+
+    fn drop_wal_id(&mut self, wal_blob_id: &str) -> Result<(), MemTableError> {
+        debug_assert_ne!(self.wal.blob_id_ref(), wal_blob_id);
+        if let Some(next) = &mut self.next {
+            if next.wal.blob_id_ref() == wal_blob_id {
+                let mut replace = None;
+                std::mem::swap(&mut self.next, &mut replace);
+                self.next = replace;
+                return Ok(());
+            } else {
+                return next.drop_wal_id(wal_blob_id);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn get(&self, key: &[u8]) -> Option<TombstoneValue> {
         if let Some(value) = self.skip_list.get(key).map(|value| (*value).clone()) {
             return Some(value);
         }
-        let mut option = self.next.clone();
+        let mut entry_ref = if let Some(next) = &self.next {
+            next
+        } else {
+            return None;
+        };
         loop {
-            if let Some(next) = option {
-                if let Some(value) = next
-                    .read()
-                    .unwrap()
-                    .skip_list
-                    .get(key)
-                    .map(|value| (*value).clone())
-                {
-                    return Some(value);
-                }
-                option = next.read().unwrap().next.clone();
+            if let Some(found) = entry_ref.skip_list.get(key) {
+                return Some(found.as_ref().clone());
+            }
+            if let Some(next) = &entry_ref.next {
+                entry_ref = next;
                 continue;
             }
             return None;
         }
     }
 
-    pub(crate) fn set<T: TombstoneValueLike>(&self, key: &[u8], value: &T) -> Result<(), WalError> {
+    /// Returns true if the WAL is full and a rotation is required.
+    pub(crate) fn set<T: TombstoneValueLike>(
+        &mut self,
+        key: &[u8],
+        value: &T,
+    ) -> Result<bool, WalError> {
         if self.finalized {
             return Err(WalError::FinalizedWal);
         }
-        self.wal.set(key, value)?;
+        let rotation_required = self.wal.set(key, value)?;
         self.skip_list.set(key, TombstoneValue::from(value));
-        Ok(())
+        Ok(rotation_required)
     }
 
+    // TODO(t/1581): This should be called by
+    // MemQueue::async_set.
+    #[allow(dead_code)]
     pub(crate) async fn async_set<T: TombstoneValueLike>(
-        &self,
+        &mut self,
         key: &[u8],
         value: &T,
     ) -> Result<(), WalError> {
@@ -152,22 +182,42 @@ impl TombstoneIterator for MemTableEntryIterator {
     type Error = MemTableError;
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct MemQueue<Ctx: Context> {
-    ctx: Ctx,
+pub(crate) struct MemQueue<B: BlobStore> {
+    blob_store: B,
     wal_id: Arc<AtomicUsize>,
     wal_config: WalWrapperConfig,
-    head: Arc<RwLock<MemQueueEntry>>,
+    head: Arc<RwLock<MemQueueEntry<B::WriteCursor>>>,
 }
 
-impl<Ctx: Context> MemQueue<Ctx>
+// Required because derived Clone for parent structs requires
+// the WriteCursor to be Clone.
+impl<B: BlobStore> Clone for MemQueue<B> {
+    fn clone(&self) -> Self {
+        Self {
+            blob_store: self.blob_store.clone(),
+            wal_id: self.wal_id.clone(),
+            wal_config: self.wal_config.clone(),
+            head: self.head.clone(),
+        }
+    }
+}
+
+// Required because derived Debug for parent structs requires
+// the WriteCursor to be Debug.
+impl<B: BlobStore> std::fmt::Debug for MemQueue<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemQueue").finish()
+    }
+}
+
+impl<B: BlobStore> MemQueue<B>
 where
-    <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
+    B::WriteCursor: Send + Sync + 'static,
 {
-    pub(crate) fn new(ctx: Ctx, wal_config: WalWrapperConfig) -> Result<Self, MemTableError> {
+    pub(crate) fn new(blob_store: B, wal_config: WalWrapperConfig) -> Result<Self, MemTableError> {
         let skip_list = ConcurrentSkipList::new();
         let head = MemQueueEntry {
-            wal: WalWrapper::new(ctx.blob_store_ref(), wal_config.clone().with_next_wal_id(0))?,
+            wal: WalWrapper::new(&blob_store, 0, wal_config.clone())?,
             skip_list,
             next: None,
             compacted: false,
@@ -175,14 +225,18 @@ where
         };
         let head = Arc::new(RwLock::new(head));
         Ok(MemQueue {
-            ctx,
+            blob_store,
             wal_id: Arc::new(AtomicUsize::new(1)),
             wal_config,
             head,
         })
     }
 
-    pub(crate) fn from_recovery(ctx: Ctx, wal: WalWrapper, next_wal_id: usize) -> MemQueue<Ctx> {
+    pub(crate) fn from_recovery(
+        blob_store: B,
+        wal: WalWrapper<B::WriteCursor>,
+        next_wal_id: usize,
+    ) -> MemQueue<B> {
         let wal_config = wal.wal_config_ref().clone();
         let skip_list = ConcurrentSkipList::new();
         let head = MemQueueEntry {
@@ -194,7 +248,7 @@ where
         };
         let head = Arc::new(RwLock::new(head));
         MemQueue {
-            ctx,
+            blob_store,
             wal_id: Arc::new(AtomicUsize::new(next_wal_id)),
             wal_config,
             head,
@@ -202,49 +256,38 @@ where
     }
 
     pub(crate) fn get(&self, key: &[u8]) -> Option<TombstoneValue> {
-        self.head.read().unwrap().get(key)
+        unlock!(self.head.read()).get(key)
     }
 
-    pub(crate) fn set<T: TombstoneValueLike>(&self, key: &[u8], value: &T) -> Result<(), WalError> {
-        self.head.read().unwrap().set(key, value)
+    /// Returns true if the WAL is full and a rotation is required.
+    pub(crate) fn set<T: TombstoneValueLike>(
+        &self,
+        key: &[u8],
+        value: &T,
+    ) -> Result<bool, WalError> {
+        unlock!(self.head.write()).set(key, value)
     }
 
+    // TODO(t/1581): This should use MemQueueEntry::async_set and the function
+    // should be marked as async. This cannot be done yet because it would
+    // required awaiting while the head is locked which triggers a lint failure
+    // (because it is a dumb thing to do).
+    // The body should instead read something like the following but without
+    // the lock:
+    //
+    // > unlock!(self.head.write()).async_set(key, value).await
     pub(crate) async fn async_set<T: TombstoneValueLike>(
         &self,
         key: &[u8],
         value: &T,
-    ) -> Result<(), WalError> {
-        loop {
-            let head;
-            {
-                // This should be safe. The underlying WAL cannot be compacted
-                // until it is finalized. If the write succeeds, then the values
-                // are readable and will be compacted. If not, then a
-                // FinalizedWal error will be returned.
-                head = self.head.read().unwrap().clone();
-            }
-            let result = head.async_set(key, value).await;
-            if let Err(WalError::FinalizedWal) = result {
-                continue;
-            }
-            return result;
-        }
+    ) -> Result<bool, WalError> {
+        unlock!(self.head.write()).set(key, value)
     }
 
     pub(crate) fn rotate(&self) -> Result<WrapData, MemTableError> {
-        let mut head = self.head.write().unwrap();
-        head.mark_finalized();
-        let wal_id = self
-            .wal_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let (new_head, wrap_data) = MemQueueEntry::wrap(
-            self.ctx.blob_store_ref(),
-            wal_id,
-            self.wal_config.clone(),
-            head.clone(),
-        )?;
-        *head = new_head;
-
+        let mut head = unlock!(self.head.write());
+        (*head).mark_finalized();
+        let wrap_data = (*head).wrap(&self.blob_store, &self.wal_id, &self.wal_config.clone())?;
         Ok(wrap_data)
     }
 
@@ -253,51 +296,24 @@ where
         wal_blob_id: &str,
         sst_blob_id: &str,
     ) -> Result<(), MemTableError> {
-        let wal = &self.head.read().unwrap().wal;
-        wal.mark_minor_compaction(wal_blob_id, sst_blob_id)?;
+        unlock!(self.head.write())
+            .wal
+            .mark_minor_compaction(wal_blob_id, sst_blob_id)?;
         Ok(())
     }
 
-    pub(crate) fn maybe_drop_arc(&self, arc: Arc<RwLock<MemQueueEntry>>) {
-        {
-            let mut entry = arc.write().unwrap();
-            entry.compacted = true;
-        }
-        self.try_drop_tail();
-    }
-
-    fn try_drop_tail(&self) {
-        let mut last_non_compacted = None;
-
-        let mut arc = self.head.clone();
-        loop {
-            let entry = arc.read().unwrap().clone();
-            if !entry.compacted {
-                last_non_compacted = Some(arc.clone());
-                if let Some(next) = entry.next.clone() {
-                    arc = next;
-                    continue;
-                }
-                return;
-            }
-            if let Some(next) = entry.next.clone() {
-                arc = next;
-                continue;
-            }
-            break;
-        }
-        if let Some(arc) = last_non_compacted {
-            let mut entry = arc.write().unwrap();
-            entry.next = None;
-        }
+    pub(crate) fn drop_wal_id(&self, old_wal_id: &str) -> Result<(), MemTableError> {
+        unlock!(self.head.write()).drop_wal_id(old_wal_id)?;
+        Ok(())
     }
 
     pub(crate) fn iter(&self) -> MergedHomogenousIter<MemTableEntryIterator> {
-        let mut entry = self.head.read().unwrap().clone();
+        let entry = unlock!(self.head.read());
+        let mut entry_ref: &MemQueueEntry<B::WriteCursor> = &entry;
         let mut iters = vec![entry.iter()];
         loop {
-            if let Some(next) = entry.next.clone() {
-                entry = next.read().unwrap().clone();
+            if let Some(next) = &entry_ref.next {
+                entry_ref = next;
                 iters.push(entry.iter());
                 continue;
             }
@@ -306,9 +322,9 @@ where
         MergedHomogenousIter::new(iters.into_iter())
     }
 
-    pub(crate) fn close(self) -> Result<(), MemTableError> {
-        let entry = self.head.write().unwrap().clone();
-        entry.wal.close()?;
+    /// WARNING: Do not use the queue after a successful call to this function.
+    pub(crate) fn close(&mut self) -> Result<(), MemTableError> {
+        unlock!(self.head.write()).wal.flush()?;
         Ok(())
     }
 }

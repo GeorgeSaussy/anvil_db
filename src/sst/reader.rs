@@ -16,7 +16,6 @@ use crate::kv::TombstonePointReader;
 use crate::kv::TombstoneValue;
 use crate::kv::TryTombstoneScanner;
 use crate::kv::{RangeSet, TombstoneIterator};
-use crate::logging::error;
 use crate::sst::common::KeyRange;
 use crate::sst::common::KeyRangeCmp;
 use crate::sst::common::SstError;
@@ -47,8 +46,8 @@ impl Drop for BlobDropper {
     }
 }
 
-pub(crate) struct SstScanner<Ctx: Context> {
-    ctx: Ctx,
+pub(crate) struct SstScanner<'a, Ctx: Context> {
+    ctx: &'a Ctx,
     meta: ThinSstMetadata,
     reader: BlockScanner,
     buffer: Vec<u8>,
@@ -59,19 +58,19 @@ pub(crate) struct SstScanner<Ctx: Context> {
     done: bool,
 }
 
-impl<Ctx: Context> Debug for SstScanner<Ctx> {
+impl<Ctx: Context> Debug for SstScanner<'_, Ctx> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SstScanner").finish()
     }
 }
 
-impl<Ctx: Context> SstScanner<Ctx> {
+impl<'a, Ctx: Context> SstScanner<'a, Ctx> {
     fn new(
-        ctx: Ctx,
+        ctx: &'a Ctx,
         meta: ThinSstMetadata,
         last_key: Option<Vec<u8>>,
         offset: usize,
-    ) -> Result<SstScanner<Ctx>, SstError> {
+    ) -> Result<SstScanner<'a, Ctx>, SstError> {
         let mut reader = BlockScanner::new(meta.blob_id_ref());
         reader.skip(offset)?;
         Ok(SstScanner {
@@ -116,8 +115,7 @@ impl<Ctx: Context> SstScanner<Ctx> {
 
         // common len
         let mut buf = vec![0_u8; 8 - self.buffer.len()];
-        if let Err(err) = self.reader.read_exact(&self.ctx, &self.meta, &mut buf) {
-            error!(self.ctx.logger(), "foo 1");
+        if let Err(err) = self.reader.read_exact(self.ctx, &self.meta, &mut buf) {
             return Some(self.poison(SstReadError::Cache(err).into()));
         }
         self.buffer.extend_from_slice(&buf);
@@ -127,8 +125,7 @@ impl<Ctx: Context> SstScanner<Ctx> {
                 return Some(
                     self.poison(
                         SstReadError::PossibleCorruption(format!(
-                            "could not parse a VarInt64 from bytes: {:?}",
-                            err
+                            "could not parse a VarInt64 from bytes: {err:?}",
                         ))
                         .into(),
                     ),
@@ -139,7 +136,7 @@ impl<Ctx: Context> SstScanner<Ctx> {
 
         // diff_len
         let mut buf = vec![0_u8; 8 - self.buffer.len()];
-        if let Err(err) = self.reader.read_exact(&self.ctx, &self.meta, &mut buf) {
+        if let Err(err) = self.reader.read_exact(self.ctx, &self.meta, &mut buf) {
             return Some(self.poison(SstReadError::Cache(err).into()));
         }
         self.buffer.extend_from_slice(&buf);
@@ -149,8 +146,7 @@ impl<Ctx: Context> SstScanner<Ctx> {
                 return Some(
                     self.poison(
                         SstReadError::PossibleCorruption(format!(
-                            "could not parse a VarInt64 from bytes: {:?}",
-                            err
+                            "could not parse a VarInt64 from bytes: {err:?}",
                         ))
                         .into(),
                     ),
@@ -166,7 +162,7 @@ impl<Ctx: Context> SstScanner<Ctx> {
         };
         if self.buffer.len() < diff_len_value {
             let mut buf = vec![0_u8; diff_len_value - self.buffer.len()];
-            if let Err(err) = self.reader.read_exact(&self.ctx, &self.meta, &mut buf) {
+            if let Err(err) = self.reader.read_exact(self.ctx, &self.meta, &mut buf) {
                 return Some(self.poison(SstReadError::Cache(err).into()));
             }
             self.buffer.extend_from_slice(&buf);
@@ -183,8 +179,8 @@ impl<Ctx: Context> SstScanner<Ctx> {
             return Some(
                 self.poison(
                     SstReadError::PossibleCorruption(format!(
-                        "common_len_value is greater than previous_key.len(): {} > {}",
-                        common_len_value,
+                        "common_len_value is greater than previous_key.len(): {common_len_value} \
+                         > {}",
                         self.previous_key.len()
                     ))
                     .into(),
@@ -197,7 +193,7 @@ impl<Ctx: Context> SstScanner<Ctx> {
         // parse value_or_del_mark
         if self.buffer.is_empty() {
             let mut buf = [0_u8];
-            if let Err(err) = self.reader.read_exact(&self.ctx, &self.meta, &mut buf) {
+            if let Err(err) = self.reader.read_exact(self.ctx, &self.meta, &mut buf) {
                 return Some(self.poison(SstReadError::Cache(err).into()));
             }
             self.buffer.extend_from_slice(&buf);
@@ -205,13 +201,13 @@ impl<Ctx: Context> SstScanner<Ctx> {
         let byte = self.buffer[0];
         self.buffer = self.buffer[1..].to_vec();
         if byte == 0 {
-            self.previous_key = key.clone();
+            self.previous_key.clone_from(&key);
             return Some(Ok(TombstonePair::deletion_marker(key)));
         }
         // parse val_len
         if self.buffer.len() < 8 {
             let mut buf = vec![0_u8; 8 - self.buffer.len()];
-            if let Err(err) = self.reader.read_exact(&self.ctx, &self.meta, &mut buf) {
+            if let Err(err) = self.reader.read_exact(self.ctx, &self.meta, &mut buf) {
                 return Some(self.poison(SstReadError::Cache(err).into()));
             }
             self.buffer.extend_from_slice(&buf);
@@ -223,8 +219,7 @@ impl<Ctx: Context> SstScanner<Ctx> {
                 return Some(
                     self.poison(
                         SstReadError::PossibleCorruption(format!(
-                            "could not parse a VarInt64 from bytes: {:?}",
-                            err
+                            "could not parse a VarInt64 from bytes: {err:?}",
                         ))
                         .into(),
                     ),
@@ -235,7 +230,7 @@ impl<Ctx: Context> SstScanner<Ctx> {
 
         if self.buffer.len() < val_len.value() as usize {
             let mut buf = vec![0_u8; val_len.value() as usize - self.buffer.len()];
-            if let Err(err) = self.reader.read_exact(&self.ctx, &self.meta, &mut buf) {
+            if let Err(err) = self.reader.read_exact(self.ctx, &self.meta, &mut buf) {
                 return Some(self.poison(SstReadError::Cache(err).into()));
             }
             self.buffer.extend_from_slice(&buf);
@@ -248,12 +243,12 @@ impl<Ctx: Context> SstScanner<Ctx> {
                 self.done = true;
             }
         }
-        self.previous_key = key.clone();
+        self.previous_key.clone_from(&key);
         Some(Ok(TombstonePair::new(key, value)))
     }
 }
 
-impl<Ctx: Context> Iterator for SstScanner<Ctx> {
+impl<Ctx: Context> Iterator for SstScanner<'_, Ctx> {
     type Item = Result<TombstonePair, SstError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -261,7 +256,7 @@ impl<Ctx: Context> Iterator for SstScanner<Ctx> {
     }
 }
 
-impl<Ctx: Context> RangeSet for SstScanner<Ctx> {
+impl<Ctx: Context> RangeSet for SstScanner<'_, Ctx> {
     fn from(mut self, key: &[u8]) -> Self {
         loop {
             if let Some(Ok(pair)) = self.next() {
@@ -281,7 +276,7 @@ impl<Ctx: Context> RangeSet for SstScanner<Ctx> {
     }
 }
 
-impl<Ctx: Context> TombstoneIterator for SstScanner<Ctx> {
+impl<Ctx: Context> TombstoneIterator for SstScanner<'_, Ctx> {
     type Error = SstError;
 }
 
@@ -314,10 +309,18 @@ impl ThinSstMetadata {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct SstReader {
     bloom_filter: BasicBloomFilter,
     thin_metadata: ThinSstMetadata,
+}
+
+impl Debug for SstReader {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SstReader")
+            .field("blob_id", &self.thin_metadata.blob_id_ref())
+            .finish()
+    }
 }
 
 impl SstReader {
@@ -336,8 +339,7 @@ impl SstReader {
                     Ok(offset) => offset,
                     Err(err) => {
                         return Err(SstError::Internal(format!(
-                            "could not convert offset to usize: {:?}",
-                            err
+                            "could not convert offset to usize: {err:?}",
                         )))
                     }
                 };
@@ -395,11 +397,11 @@ impl TombstonePointReader for SstReader {
             return Err(SstError::Internal("sst offsets are empty".to_string()));
         }
 
-        fn get_scanner<Ctx2: Context>(
-            my_ctx: &Ctx2,
+        fn get_scanner<'a, Ctx2: Context>(
+            my_ctx: &'a Ctx2,
             meta: ThinSstMetadata,
             my_key: &[u8],
-        ) -> Result<Option<SstScanner<Ctx2>>, SstError> {
+        ) -> Result<Option<SstScanner<'a, Ctx2>>, SstError> {
             let offsets = meta.offsets_ref();
             assert!(!offsets.is_empty());
 
@@ -420,7 +422,7 @@ impl TombstonePointReader for SstReader {
                 }
             }
             let offset = offsets[offset_idx].0;
-            let scanner = SstScanner::new(my_ctx.clone(), meta, None, offset)?;
+            let scanner = SstScanner::new(my_ctx, meta, None, offset)?;
             Ok(Some(scanner))
         }
         let option = get_scanner(ctx, self.thin_metadata.clone(), key)?;
@@ -439,8 +441,7 @@ impl TombstonePointReader for SstReader {
                     }
                     Err(err) => {
                         return Err(SstError::Internal(format!(
-                            "could not read next pair: {:?}",
-                            err
+                            "could not read next pair: {err:?}",
                         )))
                     }
                 }
@@ -460,12 +461,14 @@ impl TombstonePointReader for SstReader {
 
 impl TryTombstoneScanner for SstReader {
     type Error = SstError;
-    type Iter<Ctx> = SstScanner<Ctx>
-        where Ctx: Context;
+    type Iter<'a, Ctx>
+        = SstScanner<'a, Ctx>
+    where
+        Ctx: Context + 'a;
 
-    fn try_scan<Ctx: Context>(&self, ctx: &Ctx) -> Result<Self::Iter<Ctx>, Self::Error> {
+    fn try_scan<'a, Ctx: Context>(&self, ctx: &'a Ctx) -> Result<Self::Iter<'a, Ctx>, Self::Error> {
         SstScanner::new(
-            ctx.clone(),
+            ctx,
             self.thin_metadata.clone(),
             Some(self.key_range_ref().end_ref().to_vec()),
             0,

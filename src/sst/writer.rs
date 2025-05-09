@@ -1,5 +1,3 @@
-use std::fs::File;
-use std::io::Read;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -121,10 +119,9 @@ impl BlockBuilder {
         self.bytes_written += buf.len();
         match writer.write(buf) {
             Ok(_) => Ok(buf.len()),
-            Err(err) => Err(SstError::Write(format!(
-                "could not write to file: {:?}",
-                err
-            ))),
+            Err(err) => Err(SstError::Write(
+                format!("could not write to file: {err:?}",),
+            )),
         }
     }
 
@@ -158,8 +155,7 @@ impl BlockBuilder {
             Ok(common_len) => common_len,
             Err(err) => {
                 return Err(SstError::Parse(format!(
-                    "could not parse lengths {}: {:?}",
-                    my_common_len, err
+                    "could not parse lengths {my_common_len}: {err:?}",
                 )))
             }
         };
@@ -172,8 +168,7 @@ impl BlockBuilder {
             Ok(diff_len) => diff_len,
             Err(err) => {
                 return Err(SstError::Parse(format!(
-                    "could not parse lengths {}: {:?}",
-                    diff_len_value, err
+                    "could not parse lengths {diff_len_value}: {err:?}",
                 )))
             }
         };
@@ -236,8 +231,8 @@ impl<WC: WriteCursor> WriteCursor for WriteTracker<WC> {
         self.writer.write(buf)
     }
 
-    fn finalize(self) -> Result<(), BlobStoreError> {
-        self.writer.finalize()
+    fn flush(&mut self) -> Result<(), BlobStoreError> {
+        self.writer.flush()
     }
 }
 pub(crate) struct SstBuilder<WC: WriteCursor> {
@@ -304,15 +299,13 @@ impl<WC: WriteCursor> SstBuilder<WC> {
         let total = [buf, buf_len_bytes.to_vec()].concat();
         if let Err(err) = self.writer.write(&total) {
             return Err(SstError::Write(format!(
-                "could not write metadata block: {:?}",
-                err
+                "could not write metadata block: {err:?}",
             )));
         }
-        if let Err(err) = self.writer.finalize() {
-            return Err(SstError::Write(format!(
-                "could not finalize file: {:?}",
-                err
-            )));
+        if let Err(err) = self.writer.flush() {
+            return Err(SstError::Write(
+                format!("could not finalize file: {err:?}",),
+            ));
         }
         Ok(())
     }
@@ -322,23 +315,52 @@ impl<WC: WriteCursor> SstBuilder<WC> {
     }
 }
 
-pub(crate) struct SstWriter<B: BlobStore> {
-    blob_store: B,
+pub(crate) struct SstWriter {
     write_settings: SstWriteSettings,
 }
 
-impl<B: BlobStore> SstWriter<B> {
-    pub(crate) fn new(blob_store: B, write_settings: SstWriteSettings) -> SstWriter<B> {
-        SstWriter {
-            blob_store,
-            write_settings,
+pub struct NameGenerator {
+    compactor_idx: usize,
+    epoch: u128,
+    counter: usize,
+}
+
+impl NameGenerator {
+    pub fn new(compactor_idx: usize) -> NameGenerator {
+        let epoch = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_nanos(),
+            Err(_) => 1337,
+        };
+
+        NameGenerator {
+            compactor_idx,
+            epoch,
+            counter: 0,
         }
     }
 
-    fn new_sst_builder(
+    fn increment_epoch(&mut self) {
+        self.epoch += 1;
+    }
+
+    fn base_name(&mut self) -> String {
+        let counter = self.counter;
+        self.counter += 1;
+        format!("{}.{}.{}", self.compactor_idx, self.epoch, counter)
+    }
+}
+
+impl SstWriter {
+    pub(crate) fn new(write_settings: SstWriteSettings) -> SstWriter {
+        SstWriter { write_settings }
+    }
+
+    fn new_sst_builder<B: BlobStore>(
         &self,
+        blob_store: &B,
         is_minor_sst: bool,
         includes_tombstones: bool,
+        gen: &mut NameGenerator,
     ) -> Result<SstBuilder<B::WriteCursor>, SstError> {
         let mut blob_id: String;
         let blob_writer: <B as BlobStore>::WriteCursor;
@@ -348,43 +370,16 @@ impl<B: BlobStore> SstWriter<B> {
         let max_create_blob_attempts = 3;
         let mut attempt = 0;
         loop {
-            // TODO(t/1396): There should be a better way to generate
-            // new blob names.
-            let mut base_name = "".to_string();
-
-            // first try to get a random number
-            if let Ok(mut f) = File::open("/dev/urandom") {
-                let mut buf = [0u8; 16];
-                if let Ok(n) = f.read(&mut buf) {
-                    if n == 16 {
-                        base_name = buf.map(|b| b.to_string()).into_iter().collect();
-                    }
-                }
-            }
-
-            // if that fails, try to use the time stamp in epoch nanos
-            if base_name.is_empty() {
-                if let Ok(d) = SystemTime::now().duration_since(UNIX_EPOCH) {
-                    base_name = d.as_nanos().to_string();
-                }
-            }
-
-            // If that fails, use the constant name "new".
-            // If this completely fails more than once, the collision will
-            // cause a new SST not to be written.
-            if base_name.is_empty() {
-                base_name = "new".to_string();
-            }
+            let base_name = gen.base_name();
 
             blob_id = if is_minor_sst {
-                format!("{}.minor.sst", base_name)
+                format!("{base_name}.minor.sst",)
             } else if !includes_tombstones {
-                format!("{}.base.sst", base_name)
+                format!("{base_name}.base.sst",)
             } else {
-                format!("{}.sst", base_name)
+                format!("{base_name}.sst",)
             };
 
-            let blob_store = self.blob_store.clone();
             match blob_store.create_blob(&blob_id) {
                 Ok(writer) => {
                     blob_writer = writer;
@@ -393,9 +388,10 @@ impl<B: BlobStore> SstWriter<B> {
                 Err(e) => {
                     if attempt < max_create_blob_attempts - 1 {
                         attempt += 1;
+                        gen.increment_epoch();
                         continue;
                     }
-                    return Err(SstError::Write(format!("failed to create blob: {:?}", e)));
+                    return Err(SstError::Write(format!("failed to create blob: {e:?}",)));
                 }
             }
         }
@@ -403,24 +399,32 @@ impl<B: BlobStore> SstWriter<B> {
         Ok(sst_builder)
     }
 
+    /// Returns a tuple of the number of pairs written and the blob ids on
+    /// success.
     pub(crate) fn write_all<E, L: TombstonePairLike, I: Iterator<Item = Result<L, E>>>(
         self,
+        blob_store: &impl BlobStore,
         pairs: I,
-    ) -> Result<Vec<BlobId>, SstError>
+        gen: &mut NameGenerator,
+    ) -> Result<(usize, Vec<BlobId>), SstError>
     where
         SstError: From<E>,
     {
+        let mut n_pairs = 0;
         let is_minor_sst = self.write_settings.writing_minor_sst;
         let includes_tombstones = self.write_settings.keep_tombstones;
-        let mut sst_builder = self.new_sst_builder(is_minor_sst, includes_tombstones)?;
+        let mut sst_builder =
+            self.new_sst_builder(blob_store, is_minor_sst, includes_tombstones, gen)?;
         let mut blob_ids = vec![sst_builder.blob_id.clone()];
         for result in pairs {
             if !is_minor_sst && sst_builder.is_done() {
                 sst_builder.close()?;
-                sst_builder = self.new_sst_builder(is_minor_sst, includes_tombstones)?;
+                sst_builder =
+                    self.new_sst_builder(blob_store, is_minor_sst, includes_tombstones, gen)?;
                 blob_ids.push(sst_builder.blob_id.clone());
             }
             let pair = result?;
+            n_pairs += 1;
             let key_ref = pair.key_ref();
             if let Some(value_ref) = pair.value_ref().as_ref() {
                 sst_builder.write(key_ref, Some(value_ref))?;
@@ -432,6 +436,6 @@ impl<B: BlobStore> SstWriter<B> {
             sst_builder.write(key_ref, None)?;
         }
         sst_builder.close()?;
-        Ok(blob_ids)
+        Ok((n_pairs, blob_ids))
     }
 }

@@ -619,7 +619,7 @@ impl<K: Ord, V> IntoIterator for ConcurrentSkipList<K, V> {
     }
 }
 
-impl<'a, K: Ord, V> IntoIterator for &'a ConcurrentSkipList<K, V> {
+impl<K: Ord, V> IntoIterator for &ConcurrentSkipList<K, V> {
     type IntoIter = ConcurrentSkipListScanner<K, V>;
     type Item = ConcurrentSkipListPairView<K, V>;
 
@@ -628,7 +628,7 @@ impl<'a, K: Ord, V> IntoIterator for &'a ConcurrentSkipList<K, V> {
     }
 }
 
-impl<KEY, K, VAL, V: ?Sized> FromIterator<(KEY, VAL)> for ConcurrentSkipList<K, V>
+impl<KEY, K, VAL, V> FromIterator<(KEY, VAL)> for ConcurrentSkipList<K, V>
 where
     KEY: Into<K>,
     K: Ord,
@@ -816,10 +816,13 @@ impl<K: Ord, V> Iterator for ConcurrentSkipListScanner<K, V> {
 
 #[cfg(test)]
 mod test {
-    use std::thread::spawn;
+    extern crate test;
     use std::time::Instant;
 
+    use test::Bencher;
+
     use super::*;
+    use crate::helpful_macros::spawn;
     use crate::logging::debug;
 
     #[test]
@@ -844,10 +847,7 @@ mod test {
             let diff = i32::abs(even_count - odd_count);
             assert!(
                 diff < 100,
-                "Seed: {}, even: {}, odd: {}",
-                seed,
-                even_count,
-                odd_count
+                "Seed: {seed}, even: {even_count}, odd: {odd_count}",
             );
         }
     }
@@ -912,7 +912,7 @@ mod test {
         let start = Instant::now();
         for worker_idx in 0..num_workers {
             let mut skip_list_copy = skip_list.clone();
-            handles.push(spawn(move || {
+            handles.push(spawn!(move || {
                 let start_idx = worker_idx * num_entries_per_worker;
                 let mid_idx = start_idx + num_entries_per_worker / 2;
                 let end_idx = start_idx + num_entries_per_worker;
@@ -942,9 +942,26 @@ mod test {
         let total_entries = 1_000;
         while num_threads <= max_num_threads {
             let duration = run_pre_planned_benchmark(num_threads, total_entries / num_threads);
-            debug!("{} threads took {} ms", num_threads, duration);
+            debug!(&(), "{num_threads} threads took {duration} ms",);
             num_threads *= 2;
         }
+    }
+
+    #[bench]
+    fn bench_skip_list_set(b: &mut Bencher) {
+        let skip_list: ConcurrentSkipList<usize, usize> = ConcurrentSkipList::new();
+
+        let mut key = 1_usize;
+        let mut value = 1_usize;
+
+        let top_key = 2063;
+        let top_value = 2131;
+
+        b.iter(|| {
+            skip_list.set(key, value);
+            key = (key + 1) % top_key;
+            value = (value + 3) % top_value;
+        });
     }
 
     #[test]
@@ -1024,12 +1041,11 @@ mod test {
 
                 // scan over the new values
                 let view = scanner.next().unwrap();
-                assert_eq!(view.key_ref().to_vec(), idx.to_be_bytes(), "idx: {}", idx);
+                assert_eq!(view.key_ref().to_vec(), idx.to_be_bytes(), "idx: {idx}",);
                 assert_eq!(
                     view.value_ref().as_ref().unwrap().to_vec(),
                     vec![2],
-                    "idx: {}",
-                    idx
+                    "idx: {idx}",
                 );
 
                 let view = scanner.next().unwrap();

@@ -5,9 +5,9 @@ use std::fs::{create_dir, remove_dir_all};
 pub(crate) fn set_up(s: &str) -> String {
     use crate::logging::debug;
 
-    let path = format!("/tmp/.jupiter_db_{}_test_data", s);
+    let path = format!("/tmp/.jupiter_db_{s}_test_data");
     if remove_dir_all(&path).is_ok() {
-        debug!("Cleaned up old test directory.");
+        debug!(&(), "Cleaned up old test directory.");
     }
     match create_dir(&path) {
         Ok(_) => {}

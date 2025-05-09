@@ -16,6 +16,7 @@ mod test {
     use crate::sst::block_cache::cache::LruBlockCache;
     use crate::sst::block_cache::BlockCache;
     use crate::sst::reader::SstReader;
+    use crate::sst::writer::NameGenerator;
     use crate::sst::writer::SstWriteSettings;
     use crate::sst::writer::SstWriter;
     use crate::storage::blob_store::BlobStore;
@@ -34,6 +35,7 @@ mod test {
         // TODO(t/1388): Should `top` be bigger?
         let top: u64 = 1_000;
         let max_len = 100;
+        let mut gen = NameGenerator::new(0);
 
         // make data
         let mut keys = Vec::new();
@@ -62,18 +64,16 @@ mod test {
         let (compactor_tx, _compactor_rx) = channel();
 
         // test writer
-        let writer = SstWriter::new(
-            store.clone(),
-            SstWriteSettings::default().set_writing_minor_sst(true),
-        );
+        let writer = SstWriter::new(SstWriteSettings::default().set_writing_minor_sst(true));
         let mut pairs: Vec<Result<TombstonePair, ()>> = Vec::with_capacity(top as usize);
         for k in 0..top {
             let l = k as usize;
             pairs.push(Ok(TombstonePair::new(keys[l].to_vec(), values[l].clone())));
         }
         let blob_ids = writer
-            .write_all(pairs.into_iter())
-            .expect("could not write all");
+            .write_all(&store, pairs.into_iter(), &mut gen)
+            .expect("could not write all")
+            .1;
         assert_eq!(blob_ids.len(), 1);
         let sst_blob_id = &blob_ids[0];
         {
@@ -84,7 +84,7 @@ mod test {
             read_cursor
                 .read_exact(&mut buf)
                 .expect("could not read from cursor");
-            debug!("starting bytes in SST file: {:?}", buf);
+            debug!(&(), "starting bytes in SST file: {buf:?}");
         }
 
         let ctx = SimpleContext::from((
