@@ -9,13 +9,14 @@ use crate::bloom_filter::BasicBloomFilter;
 use crate::bloom_filter::BloomFilter;
 use crate::common::cmp_key;
 use crate::common::try_usize;
-use crate::compactor::CompactorMessage;
+use crate::compactor::CompactorOrder;
 use crate::context::Context;
 use crate::kv::TombstonePair;
 use crate::kv::TombstonePointReader;
 use crate::kv::TombstoneValue;
 use crate::kv::TryTombstoneScanner;
 use crate::kv::{RangeSet, TombstoneIterator};
+use crate::manifest::{ManifestOperation, SstId};
 use crate::sst::common::KeyRange;
 use crate::sst::common::KeyRangeCmp;
 use crate::sst::common::SstError;
@@ -25,12 +26,12 @@ use crate::var_int::VarInt64;
 
 #[derive(Debug)]
 struct BlobDropper {
-    blob_id: String,
-    compactor_tx: Sender<CompactorMessage>,
+    blob_id: SstId,
+    compactor_tx: Sender<CompactorOrder>,
 }
 
 impl BlobDropper {
-    fn new(blob_id: &str, compactor_tx: Sender<CompactorMessage>) -> BlobDropper {
+    fn new(blob_id: &str, compactor_tx: Sender<CompactorOrder>) -> BlobDropper {
         BlobDropper {
             blob_id: blob_id.to_string(),
             compactor_tx,
@@ -40,9 +41,12 @@ impl BlobDropper {
 
 impl Drop for BlobDropper {
     fn drop(&mut self) {
-        let _ = self
-            .compactor_tx
-            .send(CompactorMessage::DeleteBlob(self.blob_id.clone()));
+        let _ = self.compactor_tx.send(CompactorOrder::CompactorOrder(
+            ManifestOperation::GarbageCollect {
+                blob_ids: vec![self.blob_id.clone()],
+                done_tx: None,
+            },
+        ));
     }
 }
 
@@ -53,7 +57,8 @@ pub(crate) struct SstScanner<'a, Ctx: Context> {
     buffer: Vec<u8>,
     previous_key: Vec<u8>,
     return_next: Option<TombstonePair>,
-    last_key: Option<Vec<u8>>,
+    last_key: Vec<u8>,
+    last_key_of_range: Vec<u8>,
     poisoned: bool,
     done: bool,
 }
@@ -68,9 +73,10 @@ impl<'a, Ctx: Context> SstScanner<'a, Ctx> {
     fn new(
         ctx: &'a Ctx,
         meta: ThinSstMetadata,
-        last_key: Option<Vec<u8>>,
+        last_key: &[u8],
         offset: usize,
     ) -> Result<SstScanner<'a, Ctx>, SstError> {
+        let last_key = last_key.to_vec();
         let mut reader = BlockScanner::new(meta.blob_id_ref());
         reader.skip(offset)?;
         Ok(SstScanner {
@@ -80,6 +86,7 @@ impl<'a, Ctx: Context> SstScanner<'a, Ctx> {
             buffer: Vec::new(),
             previous_key: Vec::new(),
             return_next: None,
+            last_key_of_range: last_key.clone(),
             last_key,
             poisoned: false,
             done: false,
@@ -100,11 +107,9 @@ impl<'a, Ctx: Context> SstScanner<'a, Ctx> {
             return None;
         }
 
-        if let Some(last_key) = &self.last_key {
-            if self.previous_key == *last_key {
-                self.done = true;
-                return None;
-            }
+        if self.previous_key == self.last_key || self.previous_key >= self.last_key_of_range {
+            self.done = true;
+            return None;
         }
 
         if let Some(pair) = self.return_next.clone() {
@@ -125,7 +130,7 @@ impl<'a, Ctx: Context> SstScanner<'a, Ctx> {
                 return Some(
                     self.poison(
                         SstReadError::PossibleCorruption(format!(
-                            "could not parse a VarInt64 from bytes: {err:?}",
+                            "could not parse a VarInt64 from bytes: {err:?}"
                         ))
                         .into(),
                     ),
@@ -146,7 +151,7 @@ impl<'a, Ctx: Context> SstScanner<'a, Ctx> {
                 return Some(
                     self.poison(
                         SstReadError::PossibleCorruption(format!(
-                            "could not parse a VarInt64 from bytes: {err:?}",
+                            "could not parse a VarInt64 from bytes: {err:?}"
                         ))
                         .into(),
                     ),
@@ -179,9 +184,11 @@ impl<'a, Ctx: Context> SstScanner<'a, Ctx> {
             return Some(
                 self.poison(
                     SstReadError::PossibleCorruption(format!(
-                        "common_len_value is greater than previous_key.len(): {common_len_value} \
-                         > {}",
-                        self.previous_key.len()
+                        "common length ({common_len_value}) is greater than previous key length \
+                         ({len}): blob_id = {blob_id} ; previous_key = {prev:?}",
+                        len = self.previous_key.len(),
+                        blob_id = self.meta.blob_id_ref(),
+                        prev = self.previous_key
                     ))
                     .into(),
                 ),
@@ -219,7 +226,7 @@ impl<'a, Ctx: Context> SstScanner<'a, Ctx> {
                 return Some(
                     self.poison(
                         SstReadError::PossibleCorruption(format!(
-                            "could not parse a VarInt64 from bytes: {err:?}",
+                            "could not parse a VarInt64 from bytes: {err:?}"
                         ))
                         .into(),
                     ),
@@ -238,11 +245,10 @@ impl<'a, Ctx: Context> SstScanner<'a, Ctx> {
         let value = self.buffer[0..val_len.value() as usize].to_vec();
         self.buffer = self.buffer[val_len.value() as usize..].to_vec();
 
-        if let Some(last_key) = self.last_key.as_ref() {
-            if key >= *last_key {
-                self.done = true;
-            }
+        if key >= self.last_key || key >= self.last_key_of_range {
+            self.done = true;
         }
+
         self.previous_key.clone_from(&key);
         Some(Ok(TombstonePair::new(key, value)))
     }
@@ -271,7 +277,10 @@ impl<Ctx: Context> RangeSet for SstScanner<'_, Ctx> {
     }
 
     fn to(mut self, key: &[u8]) -> Self {
-        self.last_key = Some(key.to_vec());
+        if key > &self.last_key {
+            return self;
+        }
+        self.last_key_of_range = key.to_vec();
         self
     }
 }
@@ -292,7 +301,7 @@ pub(crate) struct ThinSstMetadata {
     /// size of the blob in bytes
     blob_size: usize,
     #[allow(dead_code)]
-    blob_dropper: Arc<BlobDropper>,
+    blob_dropper: Option<Arc<BlobDropper>>,
 }
 
 impl ThinSstMetadata {
@@ -327,7 +336,23 @@ impl SstReader {
     pub(crate) fn new<B: BlobStore>(
         blob_store: &B,
         blob_id: &str,
-        compactor_tx: Sender<CompactorMessage>,
+        compactor_tx: Sender<CompactorOrder>,
+    ) -> Result<SstReader, SstError> {
+        Self::new_inner(blob_store, blob_id, Some(compactor_tx))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_only<B: BlobStore>(
+        blob_store: &B,
+        blob_id: &str,
+    ) -> Result<SstReader, SstError> {
+        Self::new_inner(blob_store, blob_id, None)
+    }
+
+    fn new_inner<B: BlobStore>(
+        blob_store: &B,
+        blob_id: &str,
+        compactor_tx: Option<Sender<CompactorOrder>>,
     ) -> Result<SstReader, SstError> {
         let (metadata, blob_size) = MetadataBlock::from_blob(blob_store, blob_id)?;
 
@@ -339,7 +364,7 @@ impl SstReader {
                     Ok(offset) => offset,
                     Err(err) => {
                         return Err(SstError::Internal(format!(
-                            "could not convert offset to usize: {err:?}",
+                            "could not convert offset to usize: {err:?}"
                         )))
                     }
                 };
@@ -350,7 +375,7 @@ impl SstReader {
 
         let key_range = metadata.key_range_ref().clone();
         let blob_id = blob_id.to_string();
-        let blob_dropper = Arc::new(BlobDropper::new(&blob_id, compactor_tx));
+        let blob_dropper = compactor_tx.map(|tx| Arc::new(BlobDropper::new(&blob_id, tx)));
         let meta = ThinSstMetadata {
             blob_id,
             offsets,
@@ -401,6 +426,7 @@ impl TombstonePointReader for SstReader {
             my_ctx: &'a Ctx2,
             meta: ThinSstMetadata,
             my_key: &[u8],
+            end_key: &[u8],
         ) -> Result<Option<SstScanner<'a, Ctx2>>, SstError> {
             let offsets = meta.offsets_ref();
             assert!(!offsets.is_empty());
@@ -422,10 +448,15 @@ impl TombstonePointReader for SstReader {
                 }
             }
             let offset = offsets[offset_idx].0;
-            let scanner = SstScanner::new(my_ctx, meta, None, offset)?;
+            let scanner = SstScanner::new(my_ctx, meta, end_key, offset)?;
             Ok(Some(scanner))
         }
-        let option = get_scanner(ctx, self.thin_metadata.clone(), key)?;
+        let option = get_scanner(
+            ctx,
+            self.thin_metadata.clone(),
+            key,
+            self.key_range_ref().end_ref(),
+        )?;
         let mut scanner = match option {
             Some(scanner) => scanner,
             None => {
@@ -441,7 +472,7 @@ impl TombstonePointReader for SstReader {
                     }
                     Err(err) => {
                         return Err(SstError::Internal(format!(
-                            "could not read next pair: {err:?}",
+                            "could not read next pair: {err:?}"
                         )))
                     }
                 }
@@ -470,7 +501,7 @@ impl TryTombstoneScanner for SstReader {
         SstScanner::new(
             ctx,
             self.thin_metadata.clone(),
-            Some(self.key_range_ref().end_ref().to_vec()),
+            self.key_range_ref().end_ref(),
             0,
         )
     }

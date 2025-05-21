@@ -3,18 +3,22 @@ use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::sync::mpsc::{channel, Sender};
 
 use crate::anvil_db::AnvilDbConfig;
-use crate::compactor::{Compactor, CompactorError, CompactorMessage};
-use crate::concurrent_skip_list::{ConcurrentSkipListPairView, ConcurrentSkipListScanner};
+use crate::compactor::{Compactor, CompactorError, CompactorOrder};
 use crate::context::Context;
 use crate::helpful_macros::raw_spawn;
 use crate::kv::{
-    MergedHomogenousIter, TombstonePairLike, TombstonePointReader, TombstoneScanner,
+    MergedHomogenousIter, TombstonePair, TombstonePairLike, TombstonePointReader, TombstoneScanner,
     TombstoneStore, TombstoneValueLike,
 };
 use crate::logging::{error, info};
+use crate::manifest::{
+    LoadedManifestUpdate, ManifestOperation, ManifestUpdate, ManifestUpdateType,
+};
 use crate::mem_queue::{MemQueue, MemTableEntryIterator};
 use crate::sst::common::SstError;
-use crate::tablet::TabletSstStore;
+use crate::sst::writer::SstWriteSettings;
+use crate::structs::skip_list::{SkipListScanItem, SkipListScanner};
+use crate::tablet::Tablet;
 use crate::wal::wal_entry::WalError;
 use crate::wal::wal_wrapper::{WalWrapper, WalWrapperConfig};
 use crate::{kv::TombstoneValue, storage::blob_store::BlobStore};
@@ -29,9 +33,9 @@ pub(crate) enum MemTableError {
 impl Display for MemTableError {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
-            MemTableError::Compactor(err) => write!(f, "CompactorError: {err:?}",),
-            MemTableError::Sst(err) => write!(f, "SstError: {err:?}",),
-            MemTableError::Wal(err) => write!(f, "WalError: {err:?}",),
+            MemTableError::Compactor(err) => write!(f, "CompactorError: {err:?}"),
+            MemTableError::Sst(err) => write!(f, "SstError: {err:?}"),
+            MemTableError::Wal(err) => write!(f, "WalError: {err:?}"),
         }
     }
 }
@@ -58,7 +62,7 @@ impl From<CompactorError> for MemTableError {
 
 impl From<MemTableError> for String {
     fn from(value: MemTableError) -> Self {
-        format!("MemTableError: {value:?}",)
+        format!("MemTableError: {value:?}")
     }
 }
 
@@ -70,14 +74,20 @@ impl From<MemTableError> for String {
 pub(crate) struct MemTable<Ctx: Context> {
     ctx: Ctx,
     mem_queue: MemQueue<<Ctx as Context>::BlobStore>,
-    compactor_tx: Sender<CompactorMessage>,
+    compactor_tx: Sender<CompactorOrder>,
 }
 
-type RecoveryData<Ctx, T> = (MemTable<Ctx>, T, Compactor<T>, Sender<CompactorMessage>);
+type RecoveryData<Ctx> = (
+    MemTable<Ctx>,
+    Tablet,
+    Compactor<Ctx>,
+    Sender<CompactorOrder>,
+);
 
-impl<Ctx: Context + Send + 'static> MemTable<Ctx>
-where
-    <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
+impl<Ctx: Context> MemTable<Ctx>
+// where
+//     Ctx: Context + Send + 'static,
+//     <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
 {
     /// Create a new `MemTable` instance.
     ///
@@ -91,9 +101,12 @@ where
     /// A new MemTable, or an error String.
     pub(crate) fn new(
         ctx: Ctx,
-        compactor_tx: Sender<CompactorMessage>,
+        compactor_tx: Sender<CompactorOrder>,
         wal_config: WalWrapperConfig,
-    ) -> Result<MemTable<Ctx>, MemTableError> {
+    ) -> Result<MemTable<Ctx>, MemTableError>
+    where
+        <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
+    {
         Ok(MemTable {
             ctx: ctx.clone(),
             mem_queue: MemQueue::new(ctx.blob_store_ref().clone(), wal_config)?,
@@ -113,10 +126,13 @@ where
     /// # Returns
     ///
     /// A new MemTable, or an error String.
-    pub(crate) fn recover<T: TabletSstStore>(
+    pub(crate) fn recover(
         ctx: Ctx,
         config: AnvilDbConfig<<Ctx as Context>::Logger>,
-    ) -> Result<RecoveryData<Ctx, T>, MemTableError> {
+    ) -> Result<RecoveryData<Ctx>, MemTableError>
+    where
+        Ctx: 'static,
+    {
         let recovery = WalWrapper::recover(ctx.blob_store_ref().clone(), config.wal_config())?;
         let (wal_wrapper, recovery_data) = recovery;
 
@@ -124,43 +140,13 @@ where
         let mem_queue = MemQueue::from_recovery(
             ctx.blob_store_ref().clone(),
             wal_wrapper,
-            recovery_data.next_wal_id(),
+            recovery_data.next_wal_idx,
         );
 
-        let manifest_levels: Vec<String> = recovery_data
-            .manifest_ref()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let sst_store = T::recover(
-            ctx.blob_store_ref(),
-            manifest_levels.iter(),
-            compactor_tx.clone(),
-        )?;
-
-        let mut compactor = Compactor::new(
-            sst_store.clone(),
-            config.compactor_settings(),
-            compactor_tx.clone(),
-            compactor_rx,
-            0,
-        );
-        for x in recovery_data.un_compacted_updates_ref() {
-            let wal_blob_id = x.0.clone();
-            let result = compactor.minor_compact(&ctx, x.1.clone().into_iter());
-            let sst_blob_id = match result {
-                Ok(blob_id) => blob_id,
-                Err(err) => {
-                    if let CompactorError::NothingToCompact = err {
-                        info!(ctx.logger(), "skipping empty WAL {:?}", wal_blob_id);
-                        continue;
-                    } else {
-                        return Err(err.into());
-                    }
-                }
-            };
-            mem_queue.mark_minor_compaction(&wal_blob_id, &sst_blob_id)?;
-        }
+        let minors = &recovery_data.manifest.minors;
+        let levels = &recovery_data.manifest.levels;
+        info!(ctx.logger(), "manifest levels: {levels:?}");
+        let sst_store = Tablet::recover(&ctx, minors, levels, compactor_tx.clone())?;
 
         // TODO(t/1336): Here we send garbage collection to the newly created compactor
         // thread. This would be a good candidate for spawning a new async
@@ -171,27 +157,88 @@ where
             .garbage_blob_ids()
             .map(|x| x.to_string())
             .collect();
+        info!(ctx.logger(), "Garbage blob ids: {:?}", garbage_blob_ids);
         compactor_tx
-            .send(CompactorMessage::GarbageCollect {
-                blob_ids: garbage_blob_ids,
-                done_tx: None,
-            })
+            .send(CompactorOrder::CompactorOrder(
+                ManifestOperation::GarbageCollect {
+                    blob_ids: garbage_blob_ids,
+                    done_tx: None,
+                },
+            ))
             .unwrap();
 
         let mem_table = MemTable {
-            ctx,
+            ctx: ctx.clone(),
             mem_queue,
             compactor_tx: compactor_tx.clone(),
         };
+        let mut compactor = Compactor::new(
+            ctx.clone(),
+            sst_store.clone(),
+            config.compactor_settings(),
+            compactor_tx.clone(),
+            compactor_rx,
+            0,
+            mem_table.clone(),
+        );
+        for x in recovery_data.un_compacted_updates_ref() {
+            let wal_blob_id = &x.0;
+            let result = compactor.fill_minor_order(
+                &ctx,
+                wal_blob_id,
+                x.1.clone().into_iter(),
+                SstWriteSettings::default().set_writing_minor_sst(true),
+            );
+            let sst_readers = match result {
+                Ok(x) => x,
+                Err(err) => {
+                    if let CompactorError::NothingToCompact = err {
+                        info!(
+                            ctx.logger(),
+                            "nothing to compact from recovered WAL {wal_blob_id}, skipping"
+                        );
+                        continue;
+                    }
+                    return Err(err.into());
+                }
+            };
+            let sst_blob_ids: Vec<_> = sst_readers
+                .iter()
+                .map(|x| x.blob_id_ref().to_string())
+                .collect();
+            mem_table
+                .mem_queue
+                .recovery_mark_minor_compaction(&x.0, &sst_blob_ids)?;
+            let update = LoadedManifestUpdate {
+                update_type: ManifestUpdateType::Minor,
+                garbage_collected_blob_ids: vec![],
+                compacted_wal_ids: vec![wal_blob_id.clone()],
+                compacted_minor_sst_ids: vec![],
+                new_minor_ssts: vec![sst_readers],
+                level_sst_updates: vec![],
+            };
+            sst_store.update_index(&update);
+        }
 
         Ok((mem_table, sst_store, compactor, compactor_tx))
+    }
+
+    pub(crate) fn record_index_change(&self, update: &ManifestUpdate) -> Result<(), MemTableError>
+    where
+        <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
+    {
+        self.mem_queue.record_index_change(update)
     }
 
     pub(crate) async fn async_set<T: TombstoneValueLike>(
         &self,
         key: &[u8],
         value: &T,
-    ) -> Result<(), <Self as TombstoneStore>::E> {
+    ) -> Result<(), <Self as TombstoneStore>::E>
+    where
+        Ctx: Context + Send + 'static,
+        <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
+    {
         let rotation_required = self.mem_queue.async_set(key, value).await?;
         if rotation_required {
             self.background_rotate();
@@ -199,45 +246,45 @@ where
         Ok(())
     }
 
-    pub(crate) fn rotate(&self) -> Result<(), MemTableError> {
+    pub(crate) fn rotate(&self) -> Result<(), MemTableError>
+    where
+        Ctx: Context + Send + 'static,
+        <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
+    {
         let (old_wal_blob_id, iter) = self.mem_queue.rotate()?;
         let (done_tx, done_rx) = channel();
         self.compactor_tx
-            .send(CompactorMessage::MinorCompact {
-                iter: MemTableCompactorIterator { inner: iter },
+            .send(CompactorOrder::minor_order(
+                MemTableCompactorIterator::Operational(iter),
+                old_wal_blob_id.clone(),
                 done_tx,
-            })
+            ))
             .unwrap();
-        match done_rx.recv().unwrap() {
-            Ok(new_blob_id) => {
-                self.mem_queue
-                    .mark_minor_compaction(&old_wal_blob_id, &new_blob_id)?;
+        if let Err(err) = done_rx.recv().unwrap() {
+            if let CompactorError::NothingToCompact = err {
+                error!(self.ctx.logger(), "error compacting: {:?}", err);
+                return Err(err.into());
             }
-            Err(err) => {
-                if let CompactorError::NothingToCompact = err {
-                    error!(self.ctx.logger(), "error compacting: {:?}", err);
-                    return Err(err.into());
-                }
-                info!(
-                    self.ctx.logger(),
-                    "cleaning up unused wal blob {}", old_wal_blob_id
-                );
-            }
+            info!(
+                self.ctx.logger(),
+                "cleaning up unused wal blob {}", old_wal_blob_id
+            );
         }
         let (done_tx, done_rx) = channel();
         let done_tx = Some(done_tx);
         self.mem_queue.drop_wal_id(&old_wal_blob_id)?;
         self.compactor_tx
-            .send(CompactorMessage::GarbageCollect {
-                blob_ids: vec![old_wal_blob_id],
-                done_tx,
-            })
+            .send(CompactorOrder::gc_order(vec![old_wal_blob_id], done_tx))
             .unwrap();
         done_rx.recv().unwrap()?;
         Ok(())
     }
 
-    fn background_rotate(&self) {
+    fn background_rotate(&self)
+    where
+        Ctx: Context + Send + 'static,
+        <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
+    {
         let mem_table = self.clone();
         // TODO(t/1673): This should be handled by the compactor.
         raw_spawn!(move || {
@@ -253,27 +300,45 @@ where
     /// # Returns
     ///
     /// An error if the MemTable could not be closed cleanly.
-    pub(crate) fn close(mut self) -> Result<(), MemTableError> {
+    pub(crate) fn close(mut self) -> Result<(), MemTableError>
+    where
+        <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
+    {
         self.mem_queue.close()
     }
 }
 
-pub(crate) struct MemTableCompactorIteratorPair {
-    view: ConcurrentSkipListPairView<Vec<u8>, TombstoneValue>,
+pub(crate) enum MemTableCompactorIteratorPair {
+    Typical(SkipListScanItem),
+    Recovery(TombstonePair),
 }
 
 impl TombstonePairLike for MemTableCompactorIteratorPair {
     fn key_ref(&self) -> &[u8] {
-        self.view.key_ref()
+        match self {
+            MemTableCompactorIteratorPair::Typical(skip_list_scan_item) => {
+                skip_list_scan_item.key_ref()
+            }
+            MemTableCompactorIteratorPair::Recovery(tombstone_pair) => tombstone_pair.key_ref(),
+        }
     }
 
-    fn value_ref(&self) -> &TombstoneValue {
-        self.view.value_ref()
+    fn value_ref(&self) -> Option<&[u8]> {
+        match self {
+            MemTableCompactorIteratorPair::Typical(skip_list_scan_item) => {
+                skip_list_scan_item.value_ref()
+            }
+            MemTableCompactorIteratorPair::Recovery(tombstone_pair) => {
+                tombstone_pair.value_ref().as_ref()
+            }
+        }
     }
 }
 
-pub(crate) struct MemTableCompactorIterator {
-    inner: ConcurrentSkipListScanner<Vec<u8>, TombstoneValue>,
+pub(crate) enum MemTableCompactorIterator {
+    Operational(SkipListScanner),
+    #[allow(dead_code)]
+    Recovery(std::vec::IntoIter<TombstonePair>),
 }
 
 impl Debug for MemTableCompactorIterator {
@@ -286,8 +351,16 @@ impl Iterator for MemTableCompactorIterator {
     type Item = MemTableCompactorIteratorPair;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let view = self.inner.next()?;
-        Some(MemTableCompactorIteratorPair { view })
+        match self {
+            MemTableCompactorIterator::Operational(skip_list_scanner) => {
+                let view = skip_list_scanner.next()?;
+                Some(MemTableCompactorIteratorPair::Typical(view))
+            }
+            MemTableCompactorIterator::Recovery(tombstone_pairs) => {
+                let pair = tombstone_pairs.next()?;
+                Some(MemTableCompactorIteratorPair::Recovery(pair))
+            }
+        }
     }
 }
 
@@ -354,15 +427,15 @@ mod test {
     use std::time::Instant;
 
     use super::*;
-    use crate::compactor::CompactorSettings;
+    use crate::compactor::{Compactor, CompactorSettings};
     use crate::context::SimpleContext;
     use crate::helpful_macros::{clone, spawn, unwrap};
     use crate::kv::TryTombstoneScanner;
     use crate::logging::DefaultLogger;
     use crate::sst::block_cache::cache::LruBlockCache;
     use crate::sst::block_cache::BlockCache;
-    use crate::storage::blob_store::InMemoryBlobStore;
-    use crate::tablet::SmartTablet;
+    use crate::storage::blob_store::{BlobId, InMemoryBlobStore};
+    use crate::tablet::Tablet;
     use crate::var_int::VarInt64;
 
     #[test]
@@ -440,7 +513,7 @@ mod test {
             let result = mc.get(&ctx, key.data_ref());
             assert!(result.is_ok());
             let option = unwrap!(result.ok());
-            let val_out = unwrap!(unwrap!(option).as_ref()).clone();
+            let val_out = unwrap!(unwrap!(option).vec_ref()).clone();
             let val_in = val.data_ref().to_vec();
             assert!(val_out.cmp(&val_in) == Ordering::Equal);
         }
@@ -456,7 +529,7 @@ mod test {
             assert!(result.is_ok());
             let option = unwrap!(result.ok());
             assert!(option.is_some());
-            let val_out = unwrap!(unwrap!(option).as_ref()).clone();
+            let val_out = unwrap!(unwrap!(option).vec_ref()).clone();
             let val_in = val.data_ref().to_vec();
             assert!(val_out.cmp(&val_in) == Ordering::Equal);
         }
@@ -477,7 +550,7 @@ mod test {
             let result = mc.get(&ctx, key.data_ref());
             assert!(result.is_ok());
             let option = unwrap!(result.ok());
-            let val_out = unwrap!(unwrap!(option).as_ref()).clone();
+            let val_out = unwrap!(unwrap!(option).vec_ref()).clone();
             let val_in = val.data_ref().to_vec();
             assert!(val_out.cmp(&val_in) == Ordering::Equal);
         }
@@ -492,7 +565,7 @@ mod test {
             let result = mc.get(&ctx, key.data_ref());
             assert!(result.is_ok());
             let option = unwrap!(result.ok());
-            let val_out = unwrap!(unwrap!(option).as_ref()).clone();
+            let val_out = unwrap!(unwrap!(option).vec_ref()).clone();
             let val_in = val.data_ref().to_vec();
             assert!(val_out.cmp(&val_in) == Ordering::Equal);
             let val = values3[k as usize].clone();
@@ -501,7 +574,7 @@ mod test {
             let result = mc.get(&ctx, key.data_ref());
             assert!(result.is_ok());
             let option = unwrap!(result.ok());
-            let val_out = unwrap!(unwrap!(option).as_ref()).clone();
+            let val_out = unwrap!(unwrap!(option).vec_ref()).clone();
             let val_in = val.data_ref().to_vec();
             let check = val_out.cmp(&val_in) == Ordering::Equal;
             assert!(check);
@@ -516,7 +589,7 @@ mod test {
             assert!(result.is_ok());
             let option = unwrap!(result.ok());
             let val_out = unwrap!(option);
-            let val_out = val_out.as_ref();
+            let val_out = val_out.vec_ref();
             assert!(val_out.is_none());
         }
 
@@ -532,13 +605,13 @@ mod test {
             let option = unwrap!(result.ok());
             assert!(option.is_some());
             let val_out = unwrap!(option).clone();
-            assert!(val_out.as_ref().is_none());
+            assert!(val_out.vec_ref().is_none());
             let result = mc.set(key.data_ref(), &val.data_ref());
             assert!(result.is_ok());
             let result = mc.get(&ctx, key.data_ref());
             assert!(result.is_ok());
             let option = unwrap!(result.ok());
-            let val_out = unwrap!(unwrap!(option).as_ref()).clone();
+            let val_out = unwrap!(unwrap!(option).vec_ref()).clone();
             let val_in = val.data_ref().to_vec();
             assert!(val_out.cmp(&val_in) == Ordering::Equal);
         }
@@ -556,26 +629,25 @@ mod test {
 
         let logger = DefaultLogger::default();
         let ctx = SimpleContext::from((storage, LruBlockCache::with_capacity(32), logger));
-        let levels: Vec<String> = Vec::new();
-        let (compactor_tx, compactor_rx) = channel::<CompactorMessage>();
-        let sst_store = unwrap!(SmartTablet::new(
-            ctx.blob_store_ref(),
-            levels.into_iter(),
-            compactor_tx.clone(),
-        ));
-        let compactor = Compactor::new(
-            sst_store.clone(),
-            CompactorSettings::default(),
-            compactor_tx.clone(),
-            compactor_rx,
-            0,
-        );
-
+        let minors: Vec<BlobId> = Vec::new();
+        let levels: Vec<Vec<BlobId>> = Vec::new();
+        let (compactor_tx, compactor_rx) = channel::<CompactorOrder>();
+        let sst_store = unwrap!(Tablet::new(&ctx, &minors, &levels, compactor_tx.clone(),));
         let mc = unwrap!(MemTable::new(
             clone!(ctx),
             compactor_tx.clone(),
             WalWrapperConfig::default(),
         ));
+
+        let compactor = Compactor::new(
+            ctx.clone(),
+            sst_store.clone(),
+            CompactorSettings::default(),
+            compactor_tx.clone(),
+            compactor_rx,
+            0,
+            mc.clone(),
+        );
 
         // CREATE SOME DATA
         let pairs: Vec<_> = (0..top)
@@ -594,7 +666,10 @@ mod test {
         for (key, value) in pairs.iter() {
             assert!(unwrap!(mc.get(&ctx, key)).is_none());
             unwrap!(mc.set(key, &value.as_slice()));
-            assert_eq!(value, unwrap!(unwrap!(unwrap!(mc.get(&ctx, key))).as_ref()));
+            assert_eq!(
+                value,
+                unwrap!(unwrap!(unwrap!(mc.get(&ctx, key))).vec_ref())
+            );
         }
 
         // SCAN MEM_TABLE
@@ -605,15 +680,14 @@ mod test {
             let found = unwrap!(result);
             let (key, value) = &pairs[count];
             assert_eq!(key, found.key_ref());
-            assert_eq!(value, unwrap!(found.value_ref().as_ref()));
+            assert_eq!(value, unwrap!(found.value_ref().vec_ref()));
             count += 1;
         }
         assert_eq!(count, top);
 
         // RUN MINOR COMPACTION
 
-        let bg_ctx = clone!(ctx);
-        spawn!(move || compactor.run(&bg_ctx));
+        spawn!(move || compactor.run());
         unwrap!(mc.rotate());
 
         // SCAN SST_STORE
@@ -625,7 +699,7 @@ mod test {
             assert!(top > count);
             let (key, value) = &pairs[count];
             assert_eq!(pair.key_ref(), key);
-            assert_eq!(unwrap!(pair.value_ref().as_ref()), value);
+            assert_eq!(unwrap!(pair.value_ref().vec_ref()), value);
             count += 1;
         }
         assert_eq!(count, top);
@@ -636,7 +710,9 @@ mod test {
 
         // CLEAN UP
         unwrap!(mc.close());
-        unwrap!(compactor_tx.send(CompactorMessage::Shutdown));
+        let (done_tx, done_rx) = channel();
+        unwrap!(compactor_tx.send(CompactorOrder::Shutdown { done_tx }));
+        unwrap!(done_rx.recv());
     }
 
     #[test]
@@ -666,7 +742,7 @@ mod test {
                 let found = unwrap!(mc.get(&ctx, buf_2));
                 if j < i {
                     let value = unwrap!(found);
-                    assert_eq!(unwrap!(value.as_ref()), buf_2);
+                    assert_eq!(unwrap!(value.vec_ref()), buf_2);
                     continue;
                 }
                 assert!(found.is_none());
@@ -690,7 +766,7 @@ mod test {
                 let found = unwrap!(mc.get(&ctx, buf_2));
                 if j <= i {
                     let value = unwrap!(found);
-                    assert_eq!(unwrap!(value.as_ref()), buf_2);
+                    assert_eq!(unwrap!(value.vec_ref()), buf_2);
                     continue;
                 }
                 assert!(found.is_none());

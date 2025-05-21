@@ -14,7 +14,7 @@ mod test {
     #[bench]
     fn bench_writing_file_with_native_api(b: &mut Bencher) {
         let work_dir = set_up("bench_writing_file_with_native_api");
-        let path = format!("{work_dir}/output.txt",);
+        let path = format!("{work_dir}/output.txt");
 
         b.iter(|| {
             let start = Instant::now();

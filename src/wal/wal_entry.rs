@@ -3,30 +3,30 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::string::FromUtf8Error;
 
 use crate::checksum::crc32;
-use crate::common::{try_length_prefix, CastError};
+use crate::common::{
+    recover_byte, recover_length_prefixed_buffer, recover_string_matrix, recover_string_vec,
+    recover_var_int, try_length_prefix, CastError,
+};
 use crate::kv::TombstoneValueLike;
-use crate::storage::blob_store::{BlobStoreError, ReadCursor, WriteCursor};
+use crate::manifest::{LevelUpdateInfo, Manifest, ManifestUpdate, ManifestUpdateType};
+use crate::storage::blob_store::{BlobId, BlobStoreError, ReadCursor, WriteCursor};
 use crate::var_int::VarInt64;
 
+#[allow(dead_code)] // These fields are only read when printing debugging information.
 #[derive(Clone, Debug)]
 pub(crate) enum WalError {
     WriteEntryError(String),
     BlobStoreError(String),
     InvalidInput(Option<String>),
-    RecoveryError(String),
+    /// [WalRecoveryError] is boxed to keep the size of the error smaller.
+    Recovery(Box<WalRecoveryError>),
     FinalizedWal,
+    BedManifestUpdateTag(u8),
 }
 
 impl Display for WalError {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        match self {
-            WalError::WriteEntryError(err) => write!(f, "error while writing wal entry: {err}",),
-            WalError::BlobStoreError(err) => write!(f, "blob store error: {err}",),
-            WalError::InvalidInput(Some(err)) => write!(f, "invalid input: {err}",),
-            WalError::InvalidInput(None) => write!(f, "invalid input"),
-            WalError::RecoveryError(err) => write!(f, "error while recovering wal: {err}",),
-            WalError::FinalizedWal => write!(f, "wal is finalized"),
-        }
+        write!(f, "{self:?}")
     }
 }
 
@@ -34,19 +34,56 @@ impl Error for WalError {}
 
 impl From<CastError> for WalError {
     fn from(err: CastError) -> Self {
-        WalError::InvalidInput(Some(format!("cast error: {err:?}",)))
+        WalError::InvalidInput(Some(format!("cast error: {err:?}")))
     }
 }
 
 impl From<FromUtf8Error> for WalError {
     fn from(err: FromUtf8Error) -> Self {
-        WalError::InvalidInput(Some(format!("utf8 error: {err:?}",)))
+        WalError::InvalidInput(Some(format!("utf8 error: {err:?}")))
     }
 }
 
 impl From<BlobStoreError> for WalError {
     fn from(value: BlobStoreError) -> Self {
-        WalError::BlobStoreError(format!("{value:?}",))
+        WalError::BlobStoreError(format!("{value:?}"))
+    }
+}
+
+#[allow(dead_code)] // These fields are only read when printing debugging information.
+#[derive(Debug, Clone)]
+pub(crate) enum WalRecoveryError {
+    IncorrectHeader {
+        blob_id: BlobId,
+        found: [u8; 4],
+        expected: [u8; 4],
+    },
+    ReadExactFailed {
+        blob_id: BlobId,
+        err: BlobStoreError,
+    },
+    IncorrectChecksum {
+        blob_id: BlobId,
+        found: u32,
+        expected: u32,
+    },
+    UnknownEntryTag {
+        blob_id: BlobId,
+        tag: u8,
+    },
+    ManifestMismatch {
+        blob_id: BlobId,
+        /// the recovered manifest, boxed to keep the size down
+        found: Box<Manifest>,
+        /// the expected manifest, boxed to keep the size down
+        expected: Box<Manifest>,
+    },
+    BadManifestUpdate(String),
+}
+
+impl From<WalRecoveryError> for WalError {
+    fn from(value: WalRecoveryError) -> Self {
+        WalError::Recovery(Box::new(value))
     }
 }
 
@@ -54,31 +91,10 @@ pub(crate) type Checksum = u32;
 
 #[derive(Debug)]
 pub(crate) enum WalEntry {
-    Set {
-        key: Vec<u8>,
-        value: Vec<u8>,
-    },
-    Remove {
-        key: Vec<u8>,
-    },
-    MinorCompaction {
-        wal_blob_id: String,
-        sst_blob_id: String,
-    },
-    MergeCompaction {
-        /// ordered from oldest to newest
-        start_sst_blob_ids: Vec<String>,
-        end_sst_blob_id: String,
-    },
-    MajorCompaction {
-        /// ordered from oldest to newest
-        start_sst_blob_ids: Vec<String>,
-        end_sst_blob_id: String,
-    },
-    ManifestSnapshot {
-        /// ordered from oldest to newest
-        sst_blob_ids: Vec<String>,
-    },
+    Set { key: Vec<u8>, value: Vec<u8> },
+    Remove { key: Vec<u8> },
+    ManifestUpdate(ManifestUpdate),
+    ManifestSnapshot(Manifest),
 }
 
 impl<T: TombstoneValueLike> From<(&[u8], &T)> for WalEntry {
@@ -95,10 +111,8 @@ impl<T: TombstoneValueLike> From<(&[u8], &T)> for WalEntry {
 }
 
 impl WalEntry {
-    const MAJOR_COMPACTION_TAG: u8 = 4;
     const MANIFEST_SNAPSHOT_TAG: u8 = 5;
-    const MERGE_COMPACTION_TAG: u8 = 3;
-    const MINOR_COMPACTION_TAG: u8 = 2;
+    const MANIFEST_UPDATE_TAG: u8 = 7;
     const REMOVE_TAG: u8 = 1;
     const SET_TAG: u8 = 0;
 
@@ -106,10 +120,8 @@ impl WalEntry {
         match self {
             WalEntry::Set { .. } => WalEntry::SET_TAG,
             WalEntry::Remove { .. } => WalEntry::REMOVE_TAG,
-            WalEntry::MinorCompaction { .. } => WalEntry::MINOR_COMPACTION_TAG,
-            WalEntry::MergeCompaction { .. } => WalEntry::MERGE_COMPACTION_TAG,
-            WalEntry::MajorCompaction { .. } => WalEntry::MAJOR_COMPACTION_TAG,
             WalEntry::ManifestSnapshot { .. } => WalEntry::MANIFEST_SNAPSHOT_TAG,
+            WalEntry::ManifestUpdate(_manifest_update) => WalEntry::MANIFEST_UPDATE_TAG,
         }
     }
 }
@@ -130,58 +142,11 @@ impl TryFrom<&WalEntry> for Vec<u8> {
                 let b = try_length_prefix(key)?;
                 entry_buf.extend(b);
             }
-            WalEntry::MinorCompaction {
-                wal_blob_id,
-                sst_blob_id,
-            } => {
-                let bytes = wal_blob_id.as_bytes();
-                let b = try_length_prefix(bytes)?;
-                entry_buf.extend(b);
-                let bytes = sst_blob_id.as_bytes();
-                let b = try_length_prefix(bytes)?;
-                entry_buf.extend(b);
+            WalEntry::ManifestSnapshot(manifest) => {
+                manifest.serialize_to(&mut entry_buf)?;
             }
-            WalEntry::MergeCompaction {
-                start_sst_blob_ids,
-                end_sst_blob_id,
-            } => {
-                let start_sst_count = VarInt64::try_from(start_sst_blob_ids.len())?;
-                entry_buf.extend(start_sst_count.data_ref());
-                let mut bytes = Vec::new();
-                for sst_blob_id in start_sst_blob_ids {
-                    let b = try_length_prefix(sst_blob_id.as_bytes())?;
-                    bytes.extend(b);
-                }
-                entry_buf.extend(bytes);
-                let bytes = end_sst_blob_id.as_bytes();
-                let b = try_length_prefix(bytes)?;
-                entry_buf.extend(b);
-            }
-            WalEntry::MajorCompaction {
-                start_sst_blob_ids,
-                end_sst_blob_id,
-            } => {
-                let start_sst_count = VarInt64::try_from(start_sst_blob_ids.len())?;
-                entry_buf.extend(start_sst_count.data_ref());
-                let mut bytes = Vec::new();
-                for sst_blob_id in start_sst_blob_ids {
-                    let b = try_length_prefix(sst_blob_id.as_bytes())?;
-                    bytes.extend(b);
-                }
-                entry_buf.extend(bytes);
-                let bytes = end_sst_blob_id.as_bytes();
-                let b = try_length_prefix(bytes)?;
-                entry_buf.extend(b);
-            }
-            WalEntry::ManifestSnapshot { sst_blob_ids } => {
-                let sst_count = VarInt64::try_from(sst_blob_ids.len())?;
-                entry_buf.extend(sst_count.data_ref());
-                let mut bytes = Vec::new();
-                for sst_blob_id in sst_blob_ids {
-                    let b = try_length_prefix(sst_blob_id.as_bytes())?;
-                    bytes.extend(b);
-                }
-                entry_buf.extend(bytes);
+            WalEntry::ManifestUpdate(update) => {
+                update.serialize_to(&mut entry_buf)?;
             }
         }
         Ok(entry_buf)
@@ -223,153 +188,124 @@ impl WalEntryBlock {
 
     pub(crate) fn recover<RC: ReadCursor>(
         reader: &mut RC,
+        blob_id: &str,
         prev_checksum: Checksum,
     ) -> Result<(WalEntryBlock, Checksum), WalError> {
-        let (entry_count, mut checksum) = WalEntryBlock::recover_var_int(reader, prev_checksum)?;
+        let (entry_count, mut checksum) = recover_var_int(reader, prev_checksum)?;
         let mut entries = Vec::new();
         for _ in 0..entry_count.value() {
-            let (entry, new_checksum) = WalEntryBlock::recover_entry(reader, checksum)?;
+            let (entry, new_checksum) = WalEntryBlock::recover_entry(reader, blob_id, checksum)?;
             checksum = new_checksum;
             entries.push(entry);
         }
         let mut checksum_le_buf = [0_u8; 4];
         if let Err(err) = reader.read_exact(&mut checksum_le_buf) {
-            return Err(WalError::RecoveryError(format!(
-                "could not read checksum from blob: {err:?}",
-            )));
+            return Err(WalRecoveryError::ReadExactFailed {
+                blob_id: blob_id.to_string(),
+                err,
+            }
+            .into());
         }
         if checksum_le_buf != checksum.to_le_bytes() {
-            return Err(WalError::RecoveryError(
-                "checksum failed for block".to_string(),
-            ));
+            return Err(WalRecoveryError::IncorrectChecksum {
+                blob_id: blob_id.to_string(),
+                expected: checksum,
+                found: u32::from_le_bytes(checksum_le_buf),
+            }
+            .into());
         }
         Ok((WalEntryBlock::new(entries), checksum))
     }
 
-    fn recover_var_int<RC: ReadCursor>(
-        reader: &mut RC,
-        prev_checksum: Checksum,
-    ) -> Result<(VarInt64, Checksum), WalError> {
-        let i = match VarInt64::try_from_rc(reader) {
-            Ok(i) => i,
-            Err(_) => return Err(WalError::InvalidInput(None)),
-        };
-        let checksum = crc32(prev_checksum, i.data_ref());
-        Ok((i, checksum))
-    }
-
     fn recover_entry<RC: ReadCursor>(
         reader: &mut RC,
+        blob_id: &str,
         prev_checksum: Checksum,
     ) -> Result<(WalEntry, Checksum), WalError> {
         let mut buf = [0_u8];
         if let Err(err) = reader.read_exact(&mut buf) {
-            return Err(WalError::RecoveryError(format!(
-                "could not read entry tag: {err:?}",
-            )));
+            return Err(WalRecoveryError::ReadExactFailed {
+                blob_id: blob_id.to_string(),
+                err,
+            }
+            .into());
         };
         let checksum = crc32(prev_checksum, &buf);
-        match buf[0] {
+        let tag = buf[0];
+        match tag {
             WalEntry::SET_TAG => {
-                let (key, checksum) =
-                    WalEntryBlock::recover_length_prefixed_buffer(reader, checksum)?;
-                let (value, checksum) =
-                    WalEntryBlock::recover_length_prefixed_buffer(reader, checksum)?;
+                let (key, checksum) = recover_length_prefixed_buffer(reader, checksum)?;
+                let (value, checksum) = recover_length_prefixed_buffer(reader, checksum)?;
                 Ok((WalEntry::Set { key, value }, checksum))
             }
             WalEntry::REMOVE_TAG => {
-                let (key, checksum) =
-                    WalEntryBlock::recover_length_prefixed_buffer(reader, checksum)?;
+                let (key, checksum) = recover_length_prefixed_buffer(reader, checksum)?;
                 Ok((WalEntry::Remove { key }, checksum))
             }
-            WalEntry::MINOR_COMPACTION_TAG => {
-                let (wal_blob_id, checksum) =
-                    WalEntryBlock::recover_length_prefixed_buffer(reader, checksum)?;
-                let wal_blob_id = String::from_utf8(wal_blob_id)?;
-                let (sst_blob_id, checksum) =
-                    WalEntryBlock::recover_length_prefixed_buffer(reader, checksum)?;
-                let sst_blob_id = String::from_utf8(sst_blob_id)?;
-                Ok((
-                    WalEntry::MinorCompaction {
-                        wal_blob_id,
-                        sst_blob_id,
-                    },
-                    checksum,
-                ))
-            }
-            WalEntry::MERGE_COMPACTION_TAG => {
-                let (start_sst_count, mut checksum) =
-                    WalEntryBlock::recover_var_int(reader, checksum)?;
-                let mut start_sst_blob_ids = Vec::with_capacity(start_sst_count.value() as usize);
-                for _ in 0..start_sst_count.value() {
-                    let (start_sst_blob_id, new_checksum) =
-                        WalEntryBlock::recover_length_prefixed_buffer(reader, checksum)?;
-                    checksum = new_checksum;
-                    start_sst_blob_ids.push(String::from_utf8(start_sst_blob_id)?);
-                }
-                let (end_sst_blob_id, checksum) =
-                    WalEntryBlock::recover_length_prefixed_buffer(reader, checksum)?;
-                let end_sst_blob_id = String::from_utf8(end_sst_blob_id)?;
-                Ok((
-                    WalEntry::MergeCompaction {
-                        start_sst_blob_ids,
-                        end_sst_blob_id,
-                    },
-                    checksum,
-                ))
-            }
-            WalEntry::MAJOR_COMPACTION_TAG => {
-                let (start_sst_count, mut checksum) =
-                    WalEntryBlock::recover_var_int(reader, checksum)?;
-                let mut start_sst_blob_ids = Vec::with_capacity(start_sst_count.value() as usize);
-                for _ in 0..start_sst_count.value() {
-                    let (start_sst_blob_id, new_checksum) =
-                        WalEntryBlock::recover_length_prefixed_buffer(reader, checksum)?;
-                    checksum = new_checksum;
-                    start_sst_blob_ids.push(String::from_utf8(start_sst_blob_id)?);
-                }
-                let (end_sst_blob_id, checksum) =
-                    WalEntryBlock::recover_length_prefixed_buffer(reader, checksum)?;
-                let end_sst_blob_id = String::from_utf8(end_sst_blob_id)?;
-                Ok((
-                    WalEntry::MajorCompaction {
-                        start_sst_blob_ids,
-                        end_sst_blob_id,
-                    },
-                    checksum,
-                ))
-            }
             WalEntry::MANIFEST_SNAPSHOT_TAG => {
-                let (sst_count, mut checksum) = WalEntryBlock::recover_var_int(reader, checksum)?;
-                let mut sst_blob_ids = Vec::with_capacity(sst_count.value() as usize);
-                for _ in 0..sst_count.value() {
-                    let (sst_blob_id, new_checksum) =
-                        WalEntryBlock::recover_length_prefixed_buffer(reader, checksum)?;
-                    checksum = new_checksum;
-                    sst_blob_ids.push(String::from_utf8(sst_blob_id)?);
-                }
-                Ok((WalEntry::ManifestSnapshot { sst_blob_ids }, checksum))
+                let (manifest, checksum) = Manifest::recover_from(reader, checksum)?;
+                Ok((WalEntry::ManifestSnapshot(manifest), checksum))
             }
-            _ => Err(WalError::RecoveryError(
-                "could not recognize entry tag".to_string(),
-            )),
-        }
-    }
+            WalEntry::MANIFEST_UPDATE_TAG => {
+                // update_type
+                let (update_type_tag, checksum) = recover_byte(reader, checksum)?;
+                let update_type = ManifestUpdateType::try_from(update_type_tag)
+                    .map_err(WalError::BedManifestUpdateTag)?;
 
-    fn recover_length_prefixed_buffer<RC: ReadCursor>(
-        reader: &mut RC,
-        prev_checksum: Checksum,
-    ) -> Result<(Vec<u8>, Checksum), WalError> {
-        let (buf_len, checksum) = WalEntryBlock::recover_var_int(reader, prev_checksum)?;
-        let mut buf = vec![0_u8; buf_len.value() as usize];
-        if let Err(_err) = reader.read_exact(&mut buf) {
-            return Err(WalError::RecoveryError(format!(
-                "could not read key with length {}",
-                buf.len()
-            )));
+                // garbage_collected_blob_ids
+                let (garbage_collected_blob_ids, checksum) = recover_string_vec(reader, checksum)?;
+
+                // compacted_wal_ids
+                let (compacted_wal_ids, checksum) = recover_string_vec(reader, checksum)?;
+
+                // compacted_minor_sst_ids
+                let (compacted_minor_sst_ids, checksum) = recover_string_matrix(reader, checksum)?;
+
+                // new_minor_sst_ids
+                let (new_minor_sst_ids, checksum) = recover_string_matrix(reader, checksum)?;
+
+                // level_sst_updates
+                let (level_sst_update_count, mut checksum) = recover_var_int(reader, checksum)?;
+                let level_sst_update_count = level_sst_update_count.value() as usize;
+                let mut level_sst_updates = Vec::with_capacity(level_sst_update_count);
+                for _ in 0..level_sst_update_count {
+                    let (level_no, new_checksum) = recover_var_int(reader, checksum)?;
+                    checksum = new_checksum;
+                    let level_no = level_no.value() as usize;
+
+                    // compacted_sst_blob_ids
+                    let (compacted_sst_blob_ids, new_checksum) =
+                        recover_string_vec(reader, checksum)?;
+                    checksum = new_checksum;
+
+                    // new_sst_blob_ids
+                    let (new_sst_blob_ids, new_checksum) = recover_string_vec(reader, checksum)?;
+                    checksum = new_checksum;
+
+                    level_sst_updates.push(LevelUpdateInfo {
+                        level_no,
+                        compacted_sst_blob_ids,
+                        new_sst_blob_ids,
+                    });
+                }
+                Ok((
+                    WalEntry::ManifestUpdate(ManifestUpdate {
+                        update_type,
+                        garbage_collected_blob_ids,
+                        compacted_wal_ids,
+                        compacted_minor_sst_ids,
+                        new_minor_sst_ids,
+                        level_sst_updates,
+                    }),
+                    checksum,
+                ))
+            }
+            _ => Err(WalRecoveryError::UnknownEntryTag {
+                blob_id: blob_id.to_string(),
+                tag,
+            }
+            .into()),
         }
-        let checksum = crc32(checksum, &buf);
-        Ok((buf, checksum))
     }
 
     pub(crate) fn entries_ref(&self) -> &Vec<WalEntry> {
@@ -411,7 +347,7 @@ impl WalEntryBlock {
             return self.write_entries_halved(writer, start, len, prev);
         };
         if let Err(err) = writer.write(count.data_ref()) {
-            return Err(WalError::WriteEntryError(format!("{err:?}",)));
+            return Err(WalError::WriteEntryError(format!("{err:?}")));
         }
         let mut checksum = crc32(prev, count.data_ref());
         let mut entry_buf = Vec::new();
@@ -422,7 +358,7 @@ impl WalEntryBlock {
         checksum = crc32(checksum, &entry_buf);
         entry_buf.extend(checksum.to_le_bytes());
         if let Err(err) = writer.write(&entry_buf) {
-            return Err(WalError::WriteEntryError(format!("{err:?}",)));
+            return Err(WalError::WriteEntryError(format!("{err:?}")));
         }
         Ok(BlockWriteData {
             checksum,

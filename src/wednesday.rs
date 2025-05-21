@@ -43,11 +43,11 @@ mod test {
             if idx != 0 {
                 let pair = scanner.next().unwrap().unwrap();
                 if pair.key_ref().to_vec() == (idx - 1).to_be_bytes() {
-                    assert!(pair.value_ref().as_ref().is_none());
+                    assert!(pair.value_ref().vec_ref().is_none());
                     tombstone_found = true;
                 } else {
                     assert_eq!(pair.key_ref().to_vec(), (idx).to_be_bytes());
-                    assert_eq!(pair.value_ref().as_ref().unwrap().to_vec(), vec![2]);
+                    assert_eq!(pair.value_ref().vec_ref().unwrap().to_vec(), vec![2]);
                 }
             }
 
@@ -55,19 +55,19 @@ mod test {
             if tombstone_found {
                 let pair = scanner.next().unwrap().unwrap();
                 assert_eq!(pair.key_ref().to_vec(), idx.to_be_bytes());
-                let value = pair.value_ref().as_ref().unwrap().to_vec();
+                let value = pair.value_ref().vec_ref().unwrap().to_vec();
                 assert_eq!(value.len(), 1);
                 assert!(value[0] == 1 || value[0] == 2);
             }
             let pair = scanner.next().unwrap().unwrap();
             assert_eq!(pair.key_ref().to_vec(), (idx + 1).to_be_bytes());
-            assert_eq!(pair.value_ref().as_ref().unwrap().to_vec(), vec![0]);
+            assert_eq!(pair.value_ref().vec_ref().unwrap().to_vec(), vec![0]);
             let pair = scanner.next().unwrap().unwrap();
             assert_eq!(pair.key_ref().to_vec(), (idx + 2).to_be_bytes());
-            assert_eq!(pair.value_ref().as_ref().unwrap().to_vec(), vec![3]);
+            assert_eq!(pair.value_ref().vec_ref().unwrap().to_vec(), vec![3]);
             let pair = scanner.next().unwrap().unwrap();
             assert_eq!(pair.key_ref().to_vec(), (idx + 3).to_be_bytes());
-            assert_eq!(pair.value_ref().as_ref().unwrap().to_vec(), vec![1]);
+            assert_eq!(pair.value_ref().vec_ref().unwrap().to_vec(), vec![1]);
         }
 
         jdb.close().unwrap();

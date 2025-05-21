@@ -47,7 +47,7 @@ struct {
 
 struct {
     VarInt64 length;
-    uint8_t data[opaque.length];
+    uint8_t data[opaque_utf8.length];
 } opaque_utf8;
 ```
 
@@ -59,26 +59,18 @@ enum {
     set(0),
     // remove a key value pair, specified by the key
     remove(1),
-    minor_compaction(2),
-    merge_compaction(3),
-    major_compaction(4),
     manifest_snapshot(5),
+    manifest_update(7),
 } EntryTag;
 
-struct {
-    VarInt64 start_sst_blob_count;
-    // the file names of the SST files that were merged
-    // ordered from oldest to newest
-    opaque_utf8 start_sst_blob_ids[LargerCompaction.start_sst_blob_count];
-    // the name of the resulting SST file
-    opaque_utf8 end_sst_blob_id;
-} LargerCompaction;
-
 struct  {
-    VarInt64 sst_count;
-    // the file name of the active SSTs ordered from oldest to newest
-    opaque_utf8 sst_blob_ids[ManifestSnapshot.sst_count];
+    // omitted
 } ManifestSnapshot;
+
+struct {
+    // omitted
+} ManifestUpdate;
+
 
 struct {
     EntryTag type;
@@ -89,17 +81,10 @@ struct {
             opaque value;
         case remove:
             opaque key;
-        case minor_compaction:
-            // the file name of the WAL that was minor compacted
-            opaque_utf8 wal_blob_id;
-            // the resulting SST file name
-            opaque_utf8 sst_blob_id;
-        case merge_compaction:
-            LargerCompaction;
-        case major_compaction:
-            LargerCompaction;
         case manifest_snapshot:
             ManifestSnapshot;
+        case manifest_update:
+            ManifestUpdate;
     }
 } Entry;
 ```
@@ -116,3 +101,13 @@ will alert the user who can then decide how to handle the error.
 To recover the memtable from the WAL, for each entry block in order, if the
 checksum of the entry block is correct, play forward the entries in the block.
 If the checksum is incorrect, ignore the block and all subsequent blocks.
+
+## SST Format
+
+Each SST is broken into blocks. There are two types of blocks:
+
+1. Data blocks, which contain the actual key-value pairs.
+2. Index blocks, which contain the offsets of the data blocks.
+
+All blocks in an SST are data blocks except for the last block, which is an
+index block.

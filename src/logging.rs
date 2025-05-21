@@ -183,5 +183,5 @@ macro_rules! debug {
         crate::logging::Logger::debug($logger, file!(), line!(), column!(), &format!($($arg)*));
     };
 }
-#[cfg(test)]
+#[allow(unused_imports)]
 pub(crate) use debug;

@@ -103,14 +103,14 @@ mod test {
         assert_eq!(cmp_key(pair.key_ref(), &keys[0]), Ordering::Equal);
         let value_ref = pair.value_ref();
         assert!(
-            value_ref.as_ref().is_some(),
+            value_ref.vec_ref().is_some(),
             "found pair: {:?}, but should have found key {:?} and value {:?}",
             pair,
             keys[0],
             values[0]
         );
         assert_eq!(
-            cmp_key(value_ref.as_ref().unwrap(), &values[0]),
+            cmp_key(value_ref.vec_ref().unwrap(), &values[0]),
             Ordering::Equal,
             "pair value: {:?}, values[0]: {:?}",
             pair.value_ref(),
@@ -121,7 +121,7 @@ mod test {
             let pair = scanner.next().unwrap().expect("could not get next pair");
             assert_eq!(cmp_key(pair.key_ref(), &keys[l]), Ordering::Equal);
             assert_eq!(
-                cmp_key(pair.value_ref().as_ref().unwrap(), &values[l]),
+                cmp_key(pair.value_ref().vec_ref().unwrap(), &values[l]),
                 Ordering::Equal
             );
         }
@@ -133,7 +133,7 @@ mod test {
             let k = 0;
             let option = reader.get(&ctx, &keys[k]).expect("could not get key");
             let value = option.unwrap();
-            match value.as_ref() {
+            match value.vec_ref() {
                 Some(value) => {
                     assert_eq!(cmp_key(value, &values[k]), Ordering::Equal)
                 }
@@ -144,7 +144,7 @@ mod test {
         for k in 1..top {
             let option = reader.get(&ctx, &keys[k]).expect("could not get key");
             let value = option.unwrap();
-            match value.as_ref() {
+            match value.vec_ref() {
                 Some(value) => {
                     assert_eq!(cmp_key(value, &values[k]), Ordering::Equal)
                 }

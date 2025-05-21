@@ -4,123 +4,25 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::compactor::CompactorMessage;
+use crate::compactor::CompactorOrder;
 use crate::context::Context;
+use crate::helpful_macros::unlock;
 use crate::kv::{
     JoinedIter, MergedHomogenousIter, TombstonePointReader, TombstoneValue, TryTombstoneScanner,
+};
+use crate::logging::{error, info};
+use crate::manifest::{
+    LoadedLevelUpdateInfo, LoadedManifestUpdate, ManifestOperation, ManifestUpdateType, SstId,
 };
 use crate::sst::common::{KeyRangeCmp, RefKeyRange, SstError};
 use crate::sst::reader::SstReader;
 use crate::sst::reader::SstScanner;
 use crate::sst::writer::SstWriteSettings;
-use crate::storage::blob_store::BlobStore;
+use crate::storage::blob_store::BlobId;
 
-pub(crate) enum TaskCategory {
-    Any,
-    MajorCompaction,
-}
-
-#[derive(Debug)]
-pub(crate) enum CompactOrder {
-    Minor {
-        minor_sst_readers: Vec<SstReader>,
-        l0_sst_readers: Vec<SstReader>,
-        write_settings: SstWriteSettings,
-    },
-    Regular {
-        lo_sst_readers: Vec<SstReader>,
-        hi_sst_readers: Vec<SstReader>,
-        target_level_no: usize,
-        write_settings: SstWriteSettings,
-    },
-    Major {
-        minor_sst_readers: Vec<SstReader>,
-        level_sst_readers: Vec<Vec<SstReader>>,
-        target_level_no: usize,
-        write_settings: SstWriteSettings,
-    },
-}
-
-impl CompactOrder {
-    // `sst_readers` should be passed in order from oldest to youngest.
-    fn minor<I1: Iterator<Item = SstReader>, I2: Iterator<Item = SstReader>>(
-        minor_sst_readers: I1,
-        l0_sst_readers: I2,
-        base_write_settings: SstWriteSettings,
-    ) -> Self {
-        let minor_sst_readers: Vec<_> = minor_sst_readers.collect();
-        let l0_sst_readers: Vec<_> = l0_sst_readers.collect();
-        CompactOrder::Minor {
-            minor_sst_readers,
-            write_settings: base_write_settings,
-            l0_sst_readers,
-        }
-    }
-
-    fn regular<I1: Iterator<Item = SstReader>, I2: Iterator<Item = SstReader>>(
-        lo_sst_readers: I1,
-        hi_sst_readers: I2,
-        target_level_no: usize,
-        base_write_settings: SstWriteSettings,
-    ) -> Self {
-        let lo_sst_readers = lo_sst_readers.collect();
-        let hi_sst_readers = hi_sst_readers.collect();
-        let write_settings =
-            base_write_settings.scale_to_level(target_level_no, LEVEL_BLOW_UP_FACTOR);
-        CompactOrder::Regular {
-            lo_sst_readers,
-            hi_sst_readers,
-            target_level_no,
-            write_settings,
-        }
-    }
-
-    fn major<
-        I1: Iterator<Item = SstReader>,
-        I2: Iterator<Item = SstReader>,
-        I3: Iterator<Item = I2>,
-    >(
-        minor_sst_readers: I1,
-        level_sst_readers: I3,
-        target_level_no: usize,
-        base_write_settings: SstWriteSettings,
-    ) -> Self {
-        let minor_sst_readers = minor_sst_readers.collect();
-        let level_readers = level_sst_readers.map(|level| level.collect()).collect();
-        let write_settings =
-            base_write_settings.scale_to_level(target_level_no, LEVEL_BLOW_UP_FACTOR);
-        CompactOrder::Major {
-            minor_sst_readers,
-            level_sst_readers: level_readers,
-            target_level_no,
-            write_settings,
-        }
-    }
-}
-
-/// An SstStore instance is a thread safe wrapper that allows a user to read
-/// and write new SST files. It handles caching as well.
-pub(crate) trait TabletSstStore:
-    Clone + std::fmt::Debug + TombstonePointReader + TryTombstoneScanner
-{
-    fn recover<B: BlobStore, S: ToString, I: Iterator<Item = S>>(
-        blob_store: &B,
-        levels: I,
-        compactor_tx: Sender<CompactorMessage>,
-    ) -> Result<Self, SstError>;
-    fn write_settings_ref(&self) -> &SstWriteSettings;
-    fn add_minor_sst(&self, sst_reader: SstReader);
-    fn request_task(&self, category: &TaskCategory) -> Option<CompactOrder>;
-    // Result is either a new SST reader or an error.
-    fn handle_finished_task<I: Iterator<Item = SstReader>>(
-        &self,
-        original_order: &CompactOrder,
-        new_readers: I,
-    );
-}
-
+/// [Tablet] wraps the SSTs for structured reads. It also handles caching.
 #[derive(Clone)]
-pub(crate) struct SmartTablet {
+pub(crate) struct Tablet {
     write_settings: SstWriteSettings,
     /// Minor sst files, from oldest to youngest.
     ///
@@ -143,7 +45,7 @@ pub(crate) struct SmartTablet {
     levels: Arc<Vec<RwLock<Vec<SstReader>>>>,
 }
 
-impl std::fmt::Debug for SmartTablet {
+impl std::fmt::Debug for Tablet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let binding = self.minors.read().unwrap();
         let minors = binding.iter().count();
@@ -153,11 +55,9 @@ impl std::fmt::Debug for SmartTablet {
             .map(|level| {
                 let binding = level.read().unwrap();
                 binding.iter().count()
-                // .map(|r| r.blob_id_ref().to_string())
-                // .collect()
             })
             .collect();
-        f.debug_struct("SmartTablet")
+        f.debug_struct("Tablet")
             .field("minors", &minors)
             .field("levels", &levels.as_slice())
             .finish()
@@ -167,29 +67,70 @@ impl std::fmt::Debug for SmartTablet {
 const LEVEL_BLOW_UP_FACTOR: usize = 4;
 const MAX_NUM_LEVELS: usize = 8;
 
-impl SmartTablet {
-    pub(crate) fn new<B: BlobStore, S: ToString, I: Iterator<Item = S>>(
-        blob_store: &B,
-        levels: I,
-        compactor_tx: Sender<CompactorMessage>,
+impl Tablet {
+    /// TODO(nit): This should use a [Manifest] struct instead of
+    /// `minors` and `levels`.
+    pub(crate) fn new<Ctx: Context>(
+        ctx: &Ctx,
+        minors: &[BlobId],
+        levels: &[Vec<BlobId>],
+        compactor_tx: Sender<CompactorOrder>,
     ) -> Result<Self, SstError> {
-        let results: Result<Vec<_>, _> = levels
-            .map(|blob_id| SstReader::new(blob_store, &blob_id.to_string(), compactor_tx.clone()))
+        let blob_store = ctx.blob_store_ref();
+        let logger = ctx.logger();
+
+        info!(
+            logger,
+            "recovering from minors {minors:?} and levels {levels:?}"
+        );
+        let result: Result<Vec<_>, _> = minors
+            .iter()
+            .map(|blob_id| SstReader::new(blob_store, blob_id, compactor_tx.clone()))
             .collect();
-        let minors = Arc::new(RwLock::new(results?));
-        let levels = (0..MAX_NUM_LEVELS)
-            .map(|_| RwLock::new(Vec::new()))
+        let minors = Arc::new(RwLock::new(result?));
+
+        let result: Result<Vec<_>, _> = levels
+            .iter()
+            .map(|blob_ids| {
+                let level = blob_ids
+                    .iter()
+                    .map(|blob_id| SstReader::new(blob_store, blob_id, compactor_tx.clone()))
+                    .collect::<Result<Vec<_>, _>>();
+                match level {
+                    Ok(level) => Ok(RwLock::new(level)),
+                    Err(e) => {
+                        error!(logger, "failed to recover level {blob_ids:?}: {e}");
+                        Err(e)
+                    }
+                }
+            })
             .collect();
-        let levels = Arc::new(levels);
+        let mut level_vec = result?;
+        level_vec.iter_mut().for_each(|lock| {
+            let mut level = lock.write().unwrap();
+            level.sort_by(|a, b| {
+                a.key_range_ref()
+                    .start_ref()
+                    .cmp(b.key_range_ref().start_ref())
+            });
+        });
+        while level_vec.len() < MAX_NUM_LEVELS {
+            level_vec.push(RwLock::new(Vec::new()));
+        }
+        let levels = Arc::new(level_vec);
 
         // TODO(t/1392): The default write settings should be configurable.
         let write_settings = SstWriteSettings::default();
 
-        Ok(SmartTablet {
+        Ok(Tablet {
             write_settings,
             minors,
             levels,
         })
+    }
+
+    fn add_minor_sst(&self, mut sst_readers: Vec<SstReader>) {
+        unlock!(self.minors.write()).append(&mut sst_readers);
     }
 
     fn sst_snapshot(&self) -> (Vec<SstReader>, Vec<Vec<SstReader>>) {
@@ -202,7 +143,37 @@ impl SmartTablet {
         )
     }
 
-    fn most_urgent_task(&self) -> Option<CompactOrder> {
+    fn maybe_major_order(
+        &self,
+        m: Vec<SstReader>,
+        l: Vec<Vec<SstReader>>,
+    ) -> Option<ManifestOperation> {
+        let target_level_no = MAX_NUM_LEVELS - 1;
+        let write_settings = self
+            .write_settings
+            .clone()
+            .discard_tombstones()
+            .scale_to_level(target_level_no, LEVEL_BLOW_UP_FACTOR);
+        let m_count = m.len();
+        let non_base_l_count = l
+            .iter()
+            .take(MAX_NUM_LEVELS - 1)
+            .map(|level| level.len())
+            .sum::<usize>();
+        if m_count <= 1 && non_base_l_count == 0 {
+            return None;
+        }
+        Some(ManifestOperation::major_order(
+            m.into_iter(),
+            l.into_iter()
+                .enumerate()
+                .map(|(level_no, readers)| (level_no, readers.into_iter())),
+            write_settings,
+            None,
+        ))
+    }
+
+    fn most_urgent_task(&self) -> Option<ManifestOperation> {
         // TODO(t/1393): This should really look at CPU and IO load
         // and adjust based on compaction time.
         // Right now, it just looks at the number of SST and if it is greater
@@ -218,19 +189,11 @@ impl SmartTablet {
 
         // prioritize minor compaction
         if minors.len() >= 2 {
-            return if levels.is_empty() {
-                Some(CompactOrder::minor(
-                    minors.into_iter(),
-                    vec![].into_iter(),
-                    self.write_settings.clone().keep_tombstones(),
-                ))
-            } else {
-                Some(CompactOrder::minor(
-                    minors.into_iter(),
-                    levels[0].clone().into_iter(),
-                    self.write_settings.clone().keep_tombstones(),
-                ))
-            };
+            return Some(ManifestOperation::minor_merge_order(
+                minors.into_iter(),
+                levels.first().cloned().unwrap_or(Vec::new()).into_iter(),
+                self.write_settings.clone().keep_tombstones(),
+            ));
         }
 
         // Pick a random non-base level.
@@ -246,17 +209,11 @@ impl SmartTablet {
             if let Some((i, _)) = levels
                 .iter()
                 .enumerate()
-                .take(MAX_NUM_LEVELS - 1)
                 .find(|(_, level)| !level.is_empty())
             {
                 source_level = i;
             } else if !minors.is_empty() {
-                return Some(CompactOrder::major(
-                    minors.into_iter(),
-                    levels.into_iter().map(|level| level.into_iter()),
-                    MAX_NUM_LEVELS - 1,
-                    self.write_settings.clone().discard_tombstones(),
-                ));
+                return self.maybe_major_order(minors, levels);
             } else {
                 // If all levels are empty, then there is nothing to compact.
                 return None;
@@ -295,6 +252,15 @@ impl SmartTablet {
         let lo_key_range = RefKeyRange::new(lo_key, hi_key);
 
         let target_level = source_level + 1;
+        match target_level.cmp(&MAX_NUM_LEVELS) {
+            std::cmp::Ordering::Equal => {
+                return self.maybe_major_order(minors, levels);
+            }
+            std::cmp::Ordering::Greater => {
+                return None;
+            }
+            _ => {}
+        }
         let mut hi_sst_readers = Vec::with_capacity(levels[target_level].len());
         for sst_reader in &levels[target_level] {
             let cmp = sst_reader.key_range_ref().intersects_range(&lo_key_range);
@@ -307,6 +273,9 @@ impl SmartTablet {
             }
         }
 
+        if lo_sst_readers.len() == 1 && hi_sst_readers.is_empty() {
+            return self.maybe_major_order(minors, levels);
+        }
         let mut write_settings = self
             .write_settings
             .clone()
@@ -315,57 +284,73 @@ impl SmartTablet {
             write_settings = write_settings.discard_tombstones();
         }
 
-        Some(CompactOrder::regular(
-            lo_sst_readers.into_iter(),
-            hi_sst_readers.into_iter(),
-            target_level,
+        let write_settings = write_settings.scale_to_level(target_level, LEVEL_BLOW_UP_FACTOR);
+        let level_sst_readers = vec![
+            (source_level, lo_sst_readers),
+            (target_level, hi_sst_readers),
+        ];
+        Some(ManifestOperation::merge_order(
+            level_sst_readers,
             write_settings,
         ))
     }
 
-    fn clear_minors(&self, old_minors: &[SstReader]) {
-        let old_minors: HashSet<_> = old_minors.iter().map(|sst| sst.blob_id_ref()).collect();
-        let mut minors = self.minors.write().unwrap();
-        let mut minor_idx = 0;
-        while minor_idx < minors.len() {
-            let minor = &minors[minor_idx];
-            if !old_minors.contains(&minor.blob_id_ref()) {
-                minor_idx += 1;
+    /// Returns the removed [SstReader]s.
+    fn clear_minors(&self, old_minors: &[SstId]) -> Vec<SstReader> {
+        // println("clear_minors: {old_minors:?}");
+        let old_minors: HashSet<String> = old_minors.iter().cloned().collect();
+        let mut minors = unlock!(self.minors.write());
+        let mut offset = 0;
+        let mut old_readers = Vec::new();
+        while offset < minors.len() {
+            let minor = &minors[offset];
+            if !old_minors.contains(minor.blob_id_ref()) {
+                offset += 1;
                 continue;
             }
-            minors.remove(minor_idx);
+            old_readers.push(minors.remove(offset));
         }
+        old_readers
     }
 
-    fn renew_level<I: Iterator<Item = SstReader>>(
-        &self,
-        level_no: usize,
-        old_sst_readers: &[SstReader],
-        new_sst_readers: I,
-    ) {
-        let old_sst_blob_ids = old_sst_readers
-            .iter()
-            .map(|sst| sst.blob_id_ref())
-            .collect::<HashSet<_>>();
-
-        let mut level = self.levels[level_no].write().unwrap();
-        let mut sst_idx = 0;
-        let mut remove_done = false;
-        while sst_idx < level.len() {
-            let sst = &level[sst_idx];
-            if !old_sst_blob_ids.contains(&sst.blob_id_ref()) {
-                if remove_done {
-                    break;
-                }
-                sst_idx += 1;
-                continue;
+    /// Warning: The levels must be in order from low to high.
+    /// The iterator is of ([LevelNo], the old [SstReader], and the new
+    /// [SstReader]. The removed [SstReader]s are returned.
+    fn renew_levels(&self, level_info: &[LoadedLevelUpdateInfo]) -> Vec<SstReader> {
+        #[cfg(test)]
+        let mut last_level_no: Option<usize> = None;
+        let mut old_readers = Vec::new();
+        for info in level_info.iter().rev() {
+            let level_no = info.level_no;
+            let old_sst_ids = &info.compacted_sst_blob_ids;
+            let new_sst_readers = &info.new_sst_readers;
+            #[cfg(test)]
+            {
+                assert!(last_level_no.map(|last| last > level_no).unwrap_or(true));
+                last_level_no = Some(level_no);
             }
-            level.remove(sst_idx);
-            remove_done = true;
+            let old_sst_blob_ids = old_sst_ids.iter().cloned().collect::<HashSet<_>>();
+
+            let mut level = unlock!(self.levels[level_no].write());
+            let mut sst_idx = 0;
+            let mut remove_done = false;
+            while sst_idx < level.len() {
+                let sst = &level[sst_idx];
+                if !old_sst_blob_ids.contains(sst.blob_id_ref()) {
+                    if remove_done {
+                        break;
+                    }
+                    sst_idx += 1;
+                    continue;
+                }
+                old_readers.push(level.remove(sst_idx));
+                remove_done = true;
+            }
+            for sst in new_sst_readers {
+                level.insert(sst_idx, sst.clone());
+            }
         }
-        for sst in new_sst_readers {
-            level.insert(sst_idx, sst.clone());
-        }
+        old_readers
     }
 
     fn get<Ctx: Context>(&self, ctx: &Ctx, key: &[u8]) -> Result<Option<TombstoneValue>, SstError> {
@@ -392,9 +377,64 @@ impl SmartTablet {
         }
         Ok(None)
     }
+
+    pub(crate) fn recover<Ctx: Context>(
+        ctx: &Ctx,
+        minors: &[BlobId],
+        levels: &[Vec<BlobId>],
+        compactor_tx: Sender<CompactorOrder>,
+    ) -> Result<Self, SstError> {
+        Tablet::new(ctx, minors, levels, compactor_tx)
+    }
+
+    pub(crate) fn request_task(&self) -> Option<ManifestOperation> {
+        self.most_urgent_task()
+    }
+
+    /// Returns the removed [SstReader]s.
+    pub(crate) fn update_index(&self, update: &LoadedManifestUpdate) -> Vec<SstReader> {
+        // TODO(t/1397): This is not safe if their are multiple compactors.
+        // The method `clear_minors` will be fine (if slow) if their are
+        // multiple compactor threads, but the `renew_level` method assumes the
+        // list of SST in a level is the same as when a compaction was
+        // initiated.
+
+        if update.update_type == ManifestUpdateType::GarbageCollection {
+            return Vec::new();
+        }
+
+        let mut old_readers = self.renew_levels(&update.level_sst_updates);
+        self.add_minor_sst(update.new_minor_ssts.iter().flatten().cloned().collect());
+        let compacted_minors: Vec<_> = update
+            .compacted_minor_sst_ids
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+        old_readers.extend(self.clear_minors(compacted_minors.as_slice()));
+        old_readers
+    }
+
+    pub(crate) fn write_settings_ref(&self) -> &SstWriteSettings {
+        &self.write_settings
+    }
+
+    pub(crate) fn fill_major_compact_order(
+        &self,
+        minor_sst_readers: &mut Vec<Vec<SstReader>>,
+        level_sst_readers: &mut Vec<(usize, Vec<SstReader>)>,
+        target_level_no: &mut usize,
+        write_settings: &mut SstWriteSettings,
+    ) {
+        let (minors, levels) = self.sst_snapshot();
+        *minor_sst_readers = vec![minors];
+        *level_sst_readers = levels.into_iter().enumerate().collect();
+        *target_level_no = MAX_NUM_LEVELS - 1;
+        *write_settings = self.write_settings.clone().discard_tombstones();
+    }
 }
 
-impl TombstonePointReader for SmartTablet {
+impl TombstonePointReader for Tablet {
     type Error = SstError;
 
     fn get<Ctx: Context>(
@@ -406,16 +446,16 @@ impl TombstonePointReader for SmartTablet {
     }
 }
 
-pub(crate) type SmartTabletIterator<'a, Ctx> = JoinedIter<
+pub(crate) type TabletIterator<'a, Ctx> = JoinedIter<
     SstError,
     MergedHomogenousIter<SstScanner<'a, Ctx>>,
     MergedHomogenousIter<MergedHomogenousIter<SstScanner<'a, Ctx>>>,
 >;
 
-impl TryTombstoneScanner for SmartTablet {
+impl TryTombstoneScanner for Tablet {
     type Error = SstError;
     type Iter<'a, Ctx>
-        = SmartTabletIterator<'a, Ctx>
+        = TabletIterator<'a, Ctx>
     where
         Ctx: Context + 'a;
 
@@ -448,90 +488,7 @@ impl TryTombstoneScanner for SmartTablet {
     }
 }
 
-unsafe impl Send for SmartTablet {}
-
-impl TabletSstStore for SmartTablet {
-    fn recover<B: BlobStore, S: ToString, I: Iterator<Item = S>>(
-        blob_store_ref: &B,
-        levels: I,
-        compactor_tx: Sender<CompactorMessage>,
-    ) -> Result<Self, SstError> {
-        SmartTablet::new(blob_store_ref, levels, compactor_tx)
-    }
-
-    fn request_task(&self, category: &TaskCategory) -> Option<CompactOrder> {
-        match category {
-            TaskCategory::Any => self.most_urgent_task(),
-            TaskCategory::MajorCompaction => {
-                let (minors, levels) = self.sst_snapshot();
-                let level_sst_readers = levels.into_iter().map(|level| level.into_iter());
-                Some(CompactOrder::major(
-                    minors.into_iter(),
-                    level_sst_readers,
-                    MAX_NUM_LEVELS - 1,
-                    self.write_settings.clone().discard_tombstones(),
-                ))
-            }
-        }
-    }
-
-    fn handle_finished_task<I: Iterator<Item = SstReader>>(
-        &self,
-        original_order: &CompactOrder,
-        new_readers: I,
-    ) {
-        // TODO(t/1397): This is not safe if their are multiple compactors.
-        // The method `clear_minors` will be fine (if slow) if their are
-        // multiple compactor threads, but the `renew_level` method assumes the
-        // list of SST in a level is the same as when a compaction was
-        // initiated.
-        match original_order {
-            CompactOrder::Minor {
-                minor_sst_readers,
-                l0_sst_readers,
-                ..
-            } => {
-                self.clear_minors(minor_sst_readers.as_slice());
-                self.renew_level(0, l0_sst_readers.as_slice(), new_readers);
-            }
-            CompactOrder::Regular {
-                lo_sst_readers,
-                hi_sst_readers,
-                target_level_no,
-                ..
-            } => {
-                self.renew_level(*target_level_no, hi_sst_readers, new_readers);
-                self.renew_level(*target_level_no - 1, lo_sst_readers, vec![].into_iter());
-            }
-            CompactOrder::Major {
-                minor_sst_readers,
-                level_sst_readers,
-                target_level_no,
-                ..
-            } => {
-                debug_assert_eq!(*target_level_no, MAX_NUM_LEVELS - 1);
-                debug_assert_eq!(level_sst_readers.len(), MAX_NUM_LEVELS);
-                self.renew_level(
-                    MAX_NUM_LEVELS - 1,
-                    &level_sst_readers[MAX_NUM_LEVELS - 1],
-                    new_readers,
-                );
-                for level_no in (0..MAX_NUM_LEVELS - 1).rev() {
-                    self.renew_level(level_no, &level_sst_readers[level_no], vec![].into_iter());
-                }
-                self.clear_minors(minor_sst_readers.as_slice());
-            }
-        }
-    }
-
-    fn write_settings_ref(&self) -> &SstWriteSettings {
-        &self.write_settings
-    }
-
-    fn add_minor_sst(&self, sst_reader: SstReader) {
-        self.minors.write().unwrap().push(sst_reader);
-    }
-}
+unsafe impl Send for Tablet {}
 
 #[cfg(test)]
 mod test {
@@ -554,34 +511,39 @@ mod test {
     use crate::logging::DefaultLogger;
     use crate::logging::FixPrefixLogger;
     use crate::logging::Logger;
+    use crate::mem_table::MemTable;
     use crate::sst::block_cache::cache::LruCache;
     use crate::sst::block_cache::cache::PolicyHolder;
     use crate::sst::block_cache::BlockCache;
+    use crate::sst::writer::NameGenerator;
+    use crate::storage::blob_store::BlobStore;
     use crate::storage::blob_store::InMemoryBlobStore;
+    use crate::wal::wal_wrapper::WalWrapperConfig;
 
     type SuperSimpleContext<L> = SimpleContext<InMemoryBlobStore, PolicyHolder<LruCache>, L>;
 
     fn new_test_sst_store(
-        compactor_tx: Option<Sender<CompactorMessage>>,
-    ) -> (SuperSimpleContext<DefaultLogger>, SmartTablet) {
+        compactor_tx: Option<Sender<CompactorOrder>>,
+    ) -> (SuperSimpleContext<DefaultLogger>, Tablet) {
         let logger = DefaultLogger::default();
         make_sst_store_from_logger(compactor_tx, logger)
     }
     fn make_sst_store_from_logger<L: Logger>(
-        compactor_tx: Option<Sender<CompactorMessage>>,
+        compactor_tx: Option<Sender<CompactorOrder>>,
         logger: L,
-    ) -> (SuperSimpleContext<L>, SmartTablet) {
+    ) -> (SuperSimpleContext<L>, Tablet) {
         let blob_store = InMemoryBlobStore::new();
         let ctx = SimpleContext::from((
             blob_store,
             PolicyHolder::<LruCache>::with_capacity(32),
             logger,
         ));
-        let levels: Vec<String> = Vec::new();
+        let minors = Vec::new();
+        let levels = Vec::new();
         if let Some(compactor_tx) = compactor_tx {
             return (
                 ctx.clone(),
-                SmartTablet::new(ctx.blob_store_ref(), levels.into_iter(), compactor_tx).unwrap(),
+                Tablet::new(&ctx, &minors, &levels, compactor_tx).unwrap(),
             );
         }
         let (compactor_tx, compactor_rx) = channel();
@@ -592,17 +554,37 @@ mod test {
         });
         (
             ctx.clone(),
-            SmartTablet::new(ctx.blob_store_ref(), levels.into_iter(), compactor_tx).unwrap(),
+            Tablet::new(&ctx, &minors, &levels, compactor_tx).unwrap(),
         )
     }
 
-    fn run_minor_compaction<Ctx: Context, T: TabletSstStore, I: Iterator<Item = TombstonePair>>(
+    fn run_minor_compaction<Ctx: Context + 'static, I: Iterator<Item = TombstonePair>>(
         ctx: &Ctx,
-        sst_store: T,
+        sst_store: Tablet,
+        wal_blob_id: &str,
         pairs: I,
-    ) {
-        let mut compactor = Compactor::one_off(sst_store);
-        unwrap!(compactor.minor_compact(ctx, pairs));
+    ) where
+        <<Ctx as Context>::BlobStore as BlobStore>::WriteCursor: Send + Sync + 'static,
+    {
+        let mut gen = NameGenerator::new(2019);
+        let write_settings = CompactorSettings::default().apply(
+            sst_store
+                .write_settings_ref()
+                .clone()
+                .keep_tombstones()
+                .set_writing_minor_sst(true),
+        );
+        let (compactor_tx, _compactor_rx) = channel();
+        let readers = unwrap!(Compactor::<Ctx>::minor_compact(
+            ctx,
+            "cptr-test",
+            &mut gen,
+            wal_blob_id,
+            pairs,
+            write_settings,
+            compactor_tx
+        ));
+        sst_store.add_minor_sst(readers);
     }
 
     #[test]
@@ -619,21 +601,22 @@ mod test {
                 }
             })
             .collect();
+        let wal_blob_id = "wal_blob_id";
 
         let (ctx, sst_store) = new_test_sst_store(None);
-        run_minor_compaction(&ctx, sst_store.clone(), pairs.into_iter());
+        run_minor_compaction(&ctx, sst_store.clone(), wal_blob_id, pairs.into_iter());
 
         for i in 0..top {
             let key_bytes = i.to_be_bytes().to_vec();
             let value = sst_store.get(&ctx, &key_bytes).unwrap().unwrap();
             if i % 2 == 0 {
                 assert!(
-                    value.as_ref().is_some(),
+                    value.vec_ref().is_some(),
                     "could find read value at key {key_bytes:?}; index {i}",
                 );
-                assert_eq!(*value.as_ref().unwrap(), (i * i).to_be_bytes().to_vec());
+                assert_eq!(*value.vec_ref().unwrap(), (i * i).to_be_bytes().to_vec());
             } else {
-                assert!(value.as_ref().is_none());
+                assert!(value.vec_ref().is_none());
             }
 
             let key_bytes = (top + i).to_be_bytes().to_vec();
@@ -730,7 +713,7 @@ mod test {
         let (ctx, sst_store) = new_test_sst_store(None);
 
         fn check_values<Ctx: Context>(
-            store: &SmartTablet,
+            store: &Tablet,
             ctx: &Ctx,
             top: u64,
             prime: u64,
@@ -749,12 +732,12 @@ mod test {
                 }
                 let t_value = store.get(ctx, &key_bytes).unwrap().unwrap();
                 let t_expected = expected_values[idx as usize].as_ref().unwrap().clone();
-                if t_expected.as_ref().is_none() {
-                    assert!(t_value.as_ref().is_none());
+                if t_expected.vec_ref().is_none() {
+                    assert!(t_value.vec_ref().is_none());
                     continue;
                 }
-                let expected: Vec<u8> = t_expected.as_ref().unwrap().clone();
-                assert_eq!(*t_value.as_ref().unwrap(), expected);
+                let expected: Vec<u8> = t_expected.vec_ref().unwrap().clone();
+                assert_eq!(*t_value.vec_ref().unwrap(), expected);
             }
             assert!(all_checked.iter().all(|&b| b));
         }
@@ -763,7 +746,12 @@ mod test {
         let test_values = complex_test_values(top);
 
         for (i, (wal_values, expected_values)) in test_values.into_iter().enumerate() {
-            run_minor_compaction(&ctx, sst_store.clone(), wal_values.into_iter());
+            run_minor_compaction(
+                &ctx,
+                sst_store.clone(),
+                "dummy_wal_blob_id",
+                wal_values.into_iter(),
+            );
             check_values(&sst_store, &ctx, top, primes[i], &expected_values);
         }
     }
@@ -777,7 +765,12 @@ mod test {
 
         let test_values = complex_test_values(top);
         for (wal_values, raw_expected_values) in test_values.into_iter() {
-            run_minor_compaction(&ctx, sst_store.clone(), wal_values.into_iter());
+            run_minor_compaction(
+                &ctx,
+                sst_store.clone(),
+                "dummy_wal_blob_id",
+                wal_values.into_iter(),
+            );
             let expected_values = raw_expected_values
                 .into_iter()
                 .enumerate()
@@ -794,7 +787,7 @@ mod test {
                 let found_pair = result.unwrap();
                 let (key_bytes, expected_value) = expected_values[idx].clone();
                 assert_eq!(found_pair.key_ref(), &key_bytes);
-                assert_eq!(found_pair.value_ref().as_ref(), expected_value.as_ref());
+                assert_eq!(found_pair.value_ref().vec_ref(), expected_value.vec_ref());
             }
         }
     }
@@ -814,24 +807,26 @@ mod test {
         );
 
         let (compactor_tx, compactor_rx) = channel();
-        let (ctx, sst_store) =
-            make_sst_store_from_logger(Some(compactor_tx.clone()), logger.clone());
-
-        info!(&logger, "made ctx, sst_store, and compactor_tx");
-
-        let compactor = Compactor::new(
-            sst_store.clone(),
-            CompactorSettings::default(),
+        let (ctx, sst_store) = new_test_sst_store(Some(compactor_tx.clone()));
+        let mem_table = unwrap!(MemTable::new(
+            ctx.clone(),
             compactor_tx.clone(),
+            WalWrapperConfig::default()
+        ));
+        let compactor = Compactor::new(
+            clone!(ctx),
+            clone!(sst_store),
+            CompactorSettings::default(),
+            clone!(compactor_tx),
             compactor_rx,
             0,
+            mem_table,
         );
-        let bg_ctx = clone!(ctx);
         {
             let logger = logger.clone();
             spawn!(move || {
                 info!(&logger, "starting compactor thread");
-                compactor.run(&bg_ctx)
+                compactor.run()
             });
         }
 
@@ -851,7 +846,7 @@ mod test {
                 let pairs: std::iter::Cloned<
                     std::iter::StepBy<std::iter::Skip<std::slice::Iter<'_, TombstonePair>>>,
                 > = wal_values.iter().skip(r).step_by(n_partitions).cloned();
-                run_minor_compaction(&ctx, sst_store.clone(), pairs.clone());
+                run_minor_compaction(&ctx, sst_store.clone(), "", pairs.clone());
                 for pair in pairs {
                     seen_values.insert(pair.key_ref().to_vec());
                 }
@@ -878,18 +873,13 @@ mod test {
                 .enumerate()
                 .filter_map(|(i, v)| {
                     let key_bytes = i.to_be_bytes().to_vec();
-                    let value = v.as_ref()?.as_ref()?.clone();
+                    let value = v.as_ref()?.vec_ref()?.clone();
                     Some((key_bytes, value))
                 })
                 .collect::<Vec<(Vec<u8>, Vec<u8>)>>();
             let logger = logger.clone();
             let num_errors = Arc::new(AtomicU32::new(0));
             std::thread::sleep(Duration::from_millis(5000));
-            // let p_expected_values: Vec<_> = expected_values
-            //     .clone()
-            //     .into_iter()
-            //     .filter_map(|(key, value)| value.as_ref().map(|value| (key,
-            // value.clone())))     .collect();
             std::thread::scope(|s| {
                 let mut children = Vec::with_capacity(n_scanners);
                 for sub_thread_id in 0..n_scanners {
@@ -908,12 +898,12 @@ mod test {
                             .map(|result| match result {
                                 Ok(ok) => ok,
                                 Err(err) => {
-                                    panic!("Error scanning: {err:?}",);
+                                    panic!("Error scanning: {err:?}");
                                 }
                             })
                             .filter_map(|pair| {
                                 pair.value_ref()
-                                    .as_ref()
+                                    .vec_ref()
                                     .map(|value| (pair.key_ref().to_vec(), value.clone()))
                             })
                             .collect();
@@ -970,10 +960,18 @@ mod test {
             }
         }
 
-        if let Err(err) = compactor_tx.send(CompactorMessage::Shutdown) {
+        let (done_tx, done_rx) = channel();
+        if let Err(err) = compactor_tx.send(CompactorOrder::Shutdown { done_tx }) {
             error!(
                 &logger,
                 "Error sending shutdown message to compactor: {err:?}",
+            );
+            return Err(logger.clone());
+        }
+        if let Err(err) = done_rx.recv() {
+            error!(
+                &logger,
+                "Error receiving shutdown message from compactor: {err:?}",
             );
             return Err(logger.clone());
         }
@@ -981,7 +979,18 @@ mod test {
     }
 
     #[test]
-    fn test_level_updates_are_atomic() {
+    fn test_level_updates_are_atomic_1() {
+        if let Err(logger) = level_updates_are_atomic_inner(0) {
+            let inner = FixPrefixLogger::new("[HISTORY]");
+            for line in logger.history_ref() {
+                debug!(&inner, "{line}");
+            }
+            panic!();
+        }
+    }
+
+    #[test]
+    fn test_level_updates_are_atomic_2() {
         let top = 4;
         let start = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::with_capacity(top);

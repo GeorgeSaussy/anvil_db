@@ -7,17 +7,18 @@ mod bloom_filter;
 mod checksum;
 mod common;
 mod compactor;
-mod concurrent_skip_list;
 mod context;
 mod helpful_macros;
 mod hopscotch;
 mod kv;
 mod logging;
+mod manifest;
 mod mem_queue;
 mod mem_table;
 mod os;
 mod sst;
 mod storage;
+mod structs;
 mod tablet;
 mod var_int;
 mod wal;
@@ -38,6 +39,7 @@ use kv::RangeSet;
 use logging::DefaultLogger;
 use sst::block_cache::cache::LruBlockCache;
 use storage::blob_store::LocalBlobStore;
+pub(crate) use structs::MarkingPtr;
 
 type SuperSimpleContext = SimpleContext<LocalBlobStore, LruBlockCache, DefaultLogger>;
 type SuperSimpleAnvilScanner<'a> = AnvilDbScanner<'a, SuperSimpleContext>;
@@ -245,7 +247,7 @@ impl Iterator for AnvilScanner<'_> {
                     return Some(Err(err));
                 }
             };
-            let value = if let Some(value) = pair.value_ref().as_ref() {
+            let value = if let Some(value) = pair.value_ref().vec_ref() {
                 value.clone()
             } else {
                 continue;

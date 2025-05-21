@@ -3,6 +3,8 @@ use crate::logging::Logger;
 use crate::sst::block_cache::BlockCache;
 use crate::storage::blob_store::BlobStore;
 
+// TODO(anvil_db): Convert most structs to traits and use default impl's to
+// avoid <Ctx> everywhere.
 pub(crate) trait Context:
     Clone + Send + Sync + From<(Self::BlobStore, Self::BlockCache, Self::Logger)>
 {

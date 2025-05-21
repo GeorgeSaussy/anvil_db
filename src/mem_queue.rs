@@ -2,26 +2,24 @@ use std::fmt::{Debug, Formatter};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
 
-use crate::concurrent_skip_list::{ConcurrentSkipList, ConcurrentSkipListScanner};
 use crate::helpful_macros::unlock;
 use crate::kv::{
-    MergedHomogenousIter, RangeSet, TombstoneIterator, TombstonePair, TombstoneValue,
-    TombstoneValueLike,
+    MergedHomogenousIter, RangeSet, TombstoneIterator, TombstonePair, TombstonePairLike,
+    TombstoneValue, TombstoneValueLike,
 };
+use crate::manifest::ManifestUpdate;
 use crate::mem_table::MemTableError;
 use crate::storage::blob_store::{BlobStore, WriteCursor};
+use crate::structs::skip_list::{SkipList, SkipListScanner};
 use crate::wal::wal_entry::WalError;
 use crate::wal::wal_wrapper::{WalWrapper, WalWrapperConfig};
 
 type WalBlobId = String;
-type WrapData = (
-    WalBlobId,
-    ConcurrentSkipListScanner<Vec<u8>, TombstoneValue>,
-);
+type WrapData = (WalBlobId, SkipListScanner);
 
 #[derive(Debug)]
 pub(crate) struct MemQueueEntry<WC> {
-    skip_list: ConcurrentSkipList<Vec<u8>, TombstoneValue>,
+    skip_list: Arc<SkipList>,
     wal: WalWrapper<WC>,
     next: Option<Box<MemQueueEntry<WC>>>,
     compacted: bool,
@@ -40,10 +38,10 @@ impl<WC: WriteCursor> MemQueueEntry<WC> {
     {
         self.wal.flush()?;
         let old_blob_id = self.wal.blob_id_ref().to_string();
-        let old_iter = self.skip_list.iter();
 
-        let mut skip_list = ConcurrentSkipList::new();
+        let mut skip_list = Arc::new(SkipList::default());
         std::mem::swap(&mut self.skip_list, &mut skip_list);
+        let old_iter = <SkipListScanner as From<_>>::from(skip_list.clone());
         let id = wal_id_itr.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut wal = WalWrapper::new(blob_store, id, wal_config.clone())?;
         std::mem::swap(&mut self.wal, &mut wal);
@@ -80,8 +78,9 @@ impl<WC: WriteCursor> MemQueueEntry<WC> {
     }
 
     pub(crate) fn get(&self, key: &[u8]) -> Option<TombstoneValue> {
-        if let Some(value) = self.skip_list.get(key).map(|value| (*value).clone()) {
-            return Some(value);
+        if let Some(value) = self.skip_list.search(key) {
+            let value = value.map(|v| unsafe { v.as_ref().unwrap().as_slice() });
+            return Some(TombstoneValue::from(&value));
         }
         let mut entry_ref = if let Some(next) = &self.next {
             next
@@ -89,8 +88,9 @@ impl<WC: WriteCursor> MemQueueEntry<WC> {
             return None;
         };
         loop {
-            if let Some(found) = entry_ref.skip_list.get(key) {
-                return Some(found.as_ref().clone());
+            if let Some(value) = entry_ref.skip_list.search(key) {
+                let value = value.map(|v| unsafe { v.as_ref().unwrap().as_slice() });
+                return Some(TombstoneValue::from(&value));
             }
             if let Some(next) = &entry_ref.next {
                 entry_ref = next;
@@ -110,7 +110,7 @@ impl<WC: WriteCursor> MemQueueEntry<WC> {
             return Err(WalError::FinalizedWal);
         }
         let rotation_required = self.wal.set(key, value)?;
-        self.skip_list.set(key, TombstoneValue::from(value));
+        self.skip_list.insert(key, value.as_ref());
         Ok(rotation_required)
     }
 
@@ -126,14 +126,13 @@ impl<WC: WriteCursor> MemQueueEntry<WC> {
             return Err(WalError::FinalizedWal);
         }
         self.wal.async_set(key, value).await?;
-        self.skip_list.set(key, TombstoneValue::from(value));
+        self.skip_list.insert(key, value.as_ref());
         Ok(())
     }
 
     pub(crate) fn iter(&self) -> MemTableEntryIterator {
-        MemTableEntryIterator {
-            inner: self.skip_list.iter(),
-        }
+        let inner = <SkipListScanner as From<_>>::from(self.skip_list.clone());
+        MemTableEntryIterator { inner }
     }
 
     /// Mark this WAL as finalized. This happens before the WAL is compacted,
@@ -145,7 +144,7 @@ impl<WC: WriteCursor> MemQueueEntry<WC> {
 }
 
 pub(crate) struct MemTableEntryIterator {
-    inner: ConcurrentSkipListScanner<Vec<u8>, TombstoneValue>,
+    inner: SkipListScanner,
 }
 
 impl Debug for MemTableEntryIterator {
@@ -159,9 +158,9 @@ impl Iterator for MemTableEntryIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         let pair = self.inner.next()?;
-        let key = pair.key_ref().to_vec();
-        let value = pair.value_ref().clone();
-        let t_pair = TombstonePair::from((key, value));
+        let key = pair.key_ref();
+        let value = pair.value_ref();
+        let t_pair = TombstonePair::from((key.to_vec(), TombstoneValue::from(&value)));
         Some(Ok(t_pair))
     }
 }
@@ -173,7 +172,7 @@ impl RangeSet for MemTableEntryIterator {
     }
 
     fn to(mut self, key: &[u8]) -> Self {
-        self.inner = self.inner.to(key.to_vec());
+        self.inner = self.inner.to(key);
         self
     }
 }
@@ -211,11 +210,11 @@ impl<B: BlobStore> std::fmt::Debug for MemQueue<B> {
 }
 
 impl<B: BlobStore> MemQueue<B>
-where
-    B::WriteCursor: Send + Sync + 'static,
+// where
+//     B::WriteCursor: Send + Sync + 'static,
 {
     pub(crate) fn new(blob_store: B, wal_config: WalWrapperConfig) -> Result<Self, MemTableError> {
-        let skip_list = ConcurrentSkipList::new();
+        let skip_list = Arc::new(SkipList::default());
         let head = MemQueueEntry {
             wal: WalWrapper::new(&blob_store, 0, wal_config.clone())?,
             skip_list,
@@ -238,7 +237,7 @@ where
         next_wal_id: usize,
     ) -> MemQueue<B> {
         let wal_config = wal.wal_config_ref().clone();
-        let skip_list = ConcurrentSkipList::new();
+        let skip_list = Arc::new(SkipList::default());
         let head = MemQueueEntry {
             wal,
             skip_list,
@@ -291,14 +290,19 @@ where
         Ok(wrap_data)
     }
 
-    pub(crate) fn mark_minor_compaction(
+    pub(crate) fn record_index_change(&self, update: &ManifestUpdate) -> Result<(), MemTableError> {
+        unlock!(self.head.write()).wal.record_index_change(update)?;
+        Ok(())
+    }
+
+    pub(crate) fn recovery_mark_minor_compaction(
         &self,
         wal_blob_id: &str,
-        sst_blob_id: &str,
+        sst_blob_ids: &[String],
     ) -> Result<(), MemTableError> {
         unlock!(self.head.write())
             .wal
-            .mark_minor_compaction(wal_blob_id, sst_blob_id)?;
+            .recovery_mark_minor_compaction(wal_blob_id, sst_blob_ids)?;
         Ok(())
     }
 

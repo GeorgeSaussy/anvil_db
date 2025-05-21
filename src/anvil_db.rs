@@ -4,19 +4,21 @@ use std::pin::Pin;
 use std::sync::mpsc::{channel, Sender};
 use std::task::{Context as TaskContext, Poll};
 
-use crate::compactor::{Compactor, CompactorError, CompactorMessage, CompactorSettings};
+use crate::compactor::{Compactor, CompactorError, CompactorOrder, CompactorSettings};
 use crate::context::Context;
 use crate::kv::{
     AsyncTombstoneIterator, JoinedIter, RangeSet, TombstoneIterator, TombstonePair,
     TombstonePointReader, TombstoneScanner, TombstoneStore, TombstoneValue,
     TryAsyncTombstoneScanner, TryTombstoneScanner,
 };
-use crate::logging::Logger;
+use crate::logging::{error, Logger};
+use crate::manifest::ManifestOperation;
 use crate::mem_table::MemTable;
 use crate::os::{LinuxInterface, OsInterface};
 use crate::sst::block_cache::BlockCache;
-use crate::storage::blob_store::BlobStore;
-use crate::tablet::{SmartTablet, SmartTabletIterator, TabletSstStore};
+use crate::sst::writer::SstWriteSettings;
+use crate::storage::blob_store::{BlobId, BlobStore};
+use crate::tablet::{Tablet, TabletIterator};
 use crate::wal::wal_wrapper::WalWrapperConfig;
 
 /// The in memory representation of a AnvilDB database.
@@ -24,15 +26,15 @@ use crate::wal::wal_wrapper::WalWrapperConfig;
 pub(crate) struct AnvilDb<Ctx: Context> {
     /// Stores library-wide configuration and backend clients.
     ctx: Ctx,
-    /// The in-memory part of the LSM tree
+    /// The in-memory part of the LSM tree and the WAL.
     /// The mem_table implementation
     /// is already thread safe, so we do not want to hold
     /// a this lock while manipulating it.
     mem_table: MemTable<Ctx>,
     /// the on-disk part of the LSM tree
-    sst_store: SmartTablet,
+    sst_store: Tablet,
     /// the compactor object
-    compactor_tx: Sender<CompactorMessage>,
+    compactor_tx: Sender<CompactorOrder>,
 }
 
 impl<Ctx: Context> AnvilDb<Ctx>
@@ -53,8 +55,13 @@ where
     where
         <Ctx as Context>::Logger: Default,
     {
-        let config = AnvilDbConfig::default();
-        Self::with_config(blob_store, config)
+        let config: AnvilDbConfig<<Ctx as Context>::Logger> = AnvilDbConfig::default();
+        let logger = config.logger.clone();
+        let x = Self::with_config(blob_store, config);
+        if let Err(err) = &x {
+            error!(&logger, "Error creating AnvilDb: {err}");
+        }
+        x
     }
 
     pub(crate) fn with_config(
@@ -65,27 +72,24 @@ where
         let block_cache = <Ctx as Context>::BlockCache::with_capacity(max_cached_blocks);
         let ctx = Ctx::from((blob_store.clone(), block_cache, config.logger.clone()));
 
-        let (compactor_tx, compactor_rx) = channel::<CompactorMessage>();
+        let (compactor_tx, compactor_rx) = channel::<CompactorOrder>();
         let mem_table = MemTable::new(ctx.clone(), compactor_tx.clone(), config.wal_config())?;
 
-        let levels: Vec<String> = Vec::new();
-        let sst_store = SmartTablet::recover(
-            ctx.blob_store_ref(),
-            levels.into_iter(),
-            compactor_tx.clone(),
-        )?;
+        let minors: Vec<BlobId> = Vec::new();
+        let levels: Vec<Vec<BlobId>> = Vec::new();
+        let sst_store = Tablet::recover(&ctx, &minors, &levels, compactor_tx.clone())?;
 
         let compactor = Compactor::new(
+            ctx.clone(),
             sst_store.clone(),
             config.compactor_settings(),
             compactor_tx.clone(),
             compactor_rx,
             0,
+            mem_table.clone(),
         );
-
-        let bg_ctx = ctx.clone();
         ctx.bg_ref()
-            .spawn_compactor_bg(move || compactor.run(&bg_ctx).unwrap());
+            .spawn_compactor_bg(move || compactor.run().unwrap());
 
         Ok(AnvilDb {
             ctx,
@@ -167,11 +171,27 @@ where
     }
 
     pub(crate) fn compact(&self) -> Result<(), String> {
-        // TODO(t/1375): Implement compaction.
         self.mem_table.rotate()?;
-        let (done_tx, done_rx) = channel::<Result<(), CompactorError>>();
+        let (done_tx, done_rx) = channel::<Result<Vec<String>, CompactorError>>();
+        let mut minor_sst_readers = Vec::new();
+        let mut level_sst_readers = Vec::new();
+        let mut target_level_no = 0;
+        let mut write_settings = SstWriteSettings::default();
+        self.sst_store.fill_major_compact_order(
+            &mut minor_sst_readers,
+            &mut level_sst_readers,
+            &mut target_level_no,
+            &mut write_settings,
+        );
         self.compactor_tx
-            .send(CompactorMessage::MajorCompaction { done_tx })
+            .send(CompactorOrder::CompactorOrder(
+                ManifestOperation::MajorCompaction {
+                    minor_sst_readers,
+                    level_sst_readers,
+                    write_settings,
+                    done_tx: Some(done_tx),
+                },
+            ))
             .unwrap();
         done_rx.recv().unwrap()?;
         Ok(())
@@ -195,9 +215,8 @@ where
 
         let (mem_table, sst_store, compactor, compactor_tx) =
             MemTable::recover(ctx.clone(), config)?;
-        let bg_ctx = ctx.clone();
         ctx.bg_ref()
-            .spawn_compactor_bg(move || compactor.run(&bg_ctx).unwrap());
+            .spawn_compactor_bg(move || compactor.run().unwrap());
 
         Ok(AnvilDb {
             ctx,
@@ -213,16 +232,20 @@ where
     ///
     /// An error String on error.
     pub(crate) fn close(self) -> Result<(), String> {
-        self.compactor_tx
-            .send(CompactorMessage::Shutdown)
-            .map_err(|err| format!("failed to send shutdown message: {err:?}",))?;
         self.mem_table.close()?;
+        let (done_tx, done_rx) = channel::<()>();
+        self.compactor_tx
+            .send(CompactorOrder::Shutdown { done_tx })
+            .map_err(|err| format!("failed to send shutdown message: {err:?}",))?;
+        done_rx
+            .recv()
+            .map_err(|err| format!("failed to receive shutdown message: {err:?}",))?;
         Ok(())
     }
 }
 
 type BigScanType<'a, Ctx> =
-    JoinedIter<String, <MemTable<Ctx> as TombstoneScanner>::Iter, SmartTabletIterator<'a, Ctx>>;
+    JoinedIter<String, <MemTable<Ctx> as TombstoneScanner>::Iter, TabletIterator<'a, Ctx>>;
 
 #[derive(Debug)]
 pub(crate) struct AnvilDbScanner<'a, Ctx: Context>
@@ -522,7 +545,7 @@ mod test {
                 let mut cx = TaskContext::from_waker(waker);
                 let poll = Pin::new(&mut future).poll(&mut cx);
                 match poll {
-                    Poll::Ready(Err(e)) => panic!("async_set failed: {e:?}",),
+                    Poll::Ready(Err(e)) => panic!("async_set failed: {e:?}"),
                     Poll::Ready(Ok(())) => {}
                     Poll::Pending => new_futures.push(future),
                 }
@@ -571,6 +594,17 @@ mod test {
     fn write_and_compact(top: usize, max_wal_bytes: usize) -> (InMemoryBlobStore, TestOnlyAnvilDb) {
         let (store, db) = db_with_max_wal_bytes(max_wal_bytes);
 
+        re_write_and_compact(top, max_wal_bytes, &store, &db);
+
+        (store, db)
+    }
+
+    fn re_write_and_compact(
+        top: usize,
+        _max_wal_bytes: usize,
+        _store: &InMemoryBlobStore,
+        db: &TestOnlyAnvilDb,
+    ) {
         let n_series = 1_009;
         let mut rng = 1337_u64;
         let series: Vec<u32> = (0..n_series)
@@ -601,8 +635,6 @@ mod test {
             duration.as_secs_f64(),
             duration.as_micros() as f64 / top as f64
         );
-
-        (store, db)
     }
 
     #[test]
@@ -621,41 +653,32 @@ mod test {
         let top = 128;
         let max_wal_bytes = 1024;
 
-        let (store, db) = write_and_compact(top, max_wal_bytes);
+        let (store, db) = db_with_max_wal_bytes(max_wal_bytes);
         let start = Instant::now();
-        loop {
-            sleep(Duration::from_millis(1000));
-            let blob_names: Vec<_> = store.blob_iter().unwrap().collect();
-            debug!(
-                &(),
-                "{} existing files:\n{}",
-                blob_names.len(),
-                blob_names.join(" ")
-            );
-            let target_sst_suffix = ".base.sst";
-            let (wal_count, target_sst_count, other_count) =
-                blob_names.iter().fold((0, 0, 0), |(wc, bc, oc), name| {
+        'outer: for _ in 0..2 {
+            re_write_and_compact(top, max_wal_bytes, &store, &db);
+            loop {
+                sleep(Duration::from_millis(1000));
+                let blob_names = store.blob_iter().unwrap().collect::<Vec<_>>();
+                let s = blob_names.join(" ");
+                debug!(&(), "existing files:\n{}", s);
+                let (wal_count, sst_count) = blob_names.iter().fold((0, 0), |(wc, sc), name| {
                     if name.starts_with("wal.") {
-                        (wc + 1, bc, oc)
-                    } else if name.ends_with(target_sst_suffix) {
-                        (wc, bc + 1, oc)
+                        (wc + 1, sc)
+                    } else if name.ends_with(".sst") {
+                        (wc, sc + 1)
                     } else {
-                        (wc, bc, oc + 1)
+                        panic!()
                     }
                 });
-            debug!(
-                &(),
-                "wal_count: {} ;  target_sst_count: {} ; other_count: {}",
-                wal_count,
-                target_sst_count,
-                other_count
-            );
-            assert!(wal_count > 0);
-            if wal_count == 1 && target_sst_count == 1 && other_count == 0 {
-                break;
-            }
-            if start.elapsed().as_secs() > 30 {
-                panic!("garbage collection took too long");
+                debug!(&(), "wal_count: {wal_count} ; sst_count {sst_count}",);
+                assert!(wal_count > 0);
+                if wal_count == 1 && (sst_count == 1 || sst_count == 2) {
+                    continue 'outer;
+                }
+                if start.elapsed().as_secs() > 30 {
+                    panic!("garbage collection took too long");
+                }
             }
         }
         db.close().unwrap();

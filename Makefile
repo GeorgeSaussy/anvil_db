@@ -21,7 +21,7 @@ presubmit:
 	cargo clippy --tests -- -D warnings
 	! grep -r -e "print!" -e "println!" src | grep -v "^src/logging.rs:"
 	$(MAKE) format
-	cargo clippy --fix --allow-dirty --allow-no-vcs
+	cargo clippy --tests --fix --allow-dirty --allow-no-vcs
 	env RUST_BACKTRACE=1 cargo test
 
 .PHONY: clean
@@ -36,7 +36,7 @@ clean:
 
 # BENCHMARKING RECIPES
 
-NO_FS_BENCH_SLUGS := bench_skip_list_set
+NO_FS_BENCH_SLUGS := bench_insert_skip
 NO_FS_BENCHES := $(addprefix bench/,$(patsubst %, %.bench.txt, $(NO_FS_BENCH_SLUGS)))
 FS_BENCHES := writing_wal_keys_unformatted \
 	bench_wal_write_throughput

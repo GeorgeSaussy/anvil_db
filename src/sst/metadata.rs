@@ -87,14 +87,14 @@ impl TryFrom<&[u8]> for SstMetadata {
         // parse blob_id
         let blob_id_len = match VarInt64::try_from(&value[offset..]) {
             Ok(var_int) => var_int,
-            Err(e) => return Err(SstError::Parse(format!("could not parse id_len: {e}",))),
+            Err(e) => return Err(SstError::Parse(format!("could not parse id_len: {e}"))),
         };
         offset += blob_id_len.len();
 
         let blob_id_data = &value[offset..(offset + blob_id_len.value() as usize)];
         let blob_id = match std::str::from_utf8(blob_id_data) {
             Ok(s) => s.to_string(),
-            Err(e) => return Err(SstError::Parse(format!("could not parse id: {e}",))),
+            Err(e) => return Err(SstError::Parse(format!("could not parse id: {e}"))),
         };
         offset += blob_id_len.value() as usize;
 
@@ -103,7 +103,7 @@ impl TryFrom<&[u8]> for SstMetadata {
             Ok(var_int) => var_int,
             Err(e) => {
                 return Err(SstError::Parse(format!(
-                    "could not parse start_key_len: {e}",
+                    "could not parse start_key_len: {e}"
                 )))
             }
         };
@@ -115,11 +115,7 @@ impl TryFrom<&[u8]> for SstMetadata {
         // parse end key
         let var_int = match VarInt64::try_from(value[offset..].as_ref()) {
             Ok(var_int) => var_int,
-            Err(e) => {
-                return Err(SstError::Parse(
-                    format!("could not parse end_key_len: {e}",),
-                ))
-            }
+            Err(e) => return Err(SstError::Parse(format!("could not parse end_key_len: {e}"))),
         };
         let end_len = var_int.value();
         offset += var_int.len();
@@ -147,7 +143,7 @@ impl MetadataBlock {
         let mut cursor = match store.read_cursor(blob_id) {
             Ok(rc) => rc,
             Err(err) => {
-                return Err(SstReadError::BlobStore((format!("blob_id: {blob_id:?}",), err)).into())
+                return Err(SstReadError::BlobStore((format!("blob_id: {blob_id:?}"), err)).into())
             }
         };
         let blob_size = cursor.size()?;
@@ -189,7 +185,7 @@ impl MetadataBlock {
             Ok(x) => x,
             Err(err) => {
                 return Err(SstError::Parse(format!(
-                    "could not parse metadata block from bytes: {err:?}",
+                    "could not parse metadata block from bytes: {err:?}"
                 )))
             }
         };
@@ -245,7 +241,7 @@ impl TryFrom<&MetadataBlock> for Vec<u8> {
             Ok(buf) => buf,
             Err(e) => {
                 return Err(SstError::Parse(format!(
-                    "could not parse bloom_filter: {e}",
+                    "could not parse bloom_filter: {e}"
                 )))
             }
         };
@@ -268,7 +264,7 @@ impl TryFrom<&MetadataBlock> for Vec<u8> {
         let metadata = block.sst_metadata();
         let metadata_buf: Vec<u8> = match Vec::try_from(&metadata) {
             Ok(buf) => buf,
-            Err(e) => return Err(SstError::Parse(format!("could not parse metadata: {e:?}",))),
+            Err(e) => return Err(SstError::Parse(format!("could not parse metadata: {e:?}"))),
         };
         let metadata_len = VarInt64::try_from(metadata_buf.len())?;
         fn u64_len(v: &VarInt64) -> Result<u64, SstError> {
@@ -289,7 +285,7 @@ impl TryFrom<&MetadataBlock> for Vec<u8> {
             Ok(var_int) => var_int,
             Err(err) => {
                 return Err(SstError::Parse(format!(
-                    "could not parse total_len: {err:?}",
+                    "could not parse total_len: {err:?}"
                 )))
             }
         };
@@ -318,14 +314,14 @@ impl TryFrom<&[u8]> for MetadataBlock {
         // parse total_len
         let total_len = match VarInt64::try_from(value) {
             Ok(var_int) => var_int,
-            Err(e) => return Err(SstError::Parse(format!("could not parse total_len: {e}",))),
+            Err(e) => return Err(SstError::Parse(format!("could not parse total_len: {e}"))),
         };
         offset += total_len.len();
 
         // parse bf_len
         let bf_len = match VarInt64::try_from(&value[offset..]) {
             Ok(var_int) => var_int,
-            Err(e) => return Err(SstError::Parse(format!("could not parse bf_len: {e}",))),
+            Err(e) => return Err(SstError::Parse(format!("could not parse bf_len: {e}"))),
         };
         offset += bf_len.len();
 
@@ -335,7 +331,7 @@ impl TryFrom<&[u8]> for MetadataBlock {
             Ok(bf) => bf,
             Err(e) => {
                 return Err(SstError::Parse(format!(
-                    "could not parse bloom_filter: {e}",
+                    "could not parse bloom_filter: {e}"
                 )))
             }
         };
@@ -344,7 +340,7 @@ impl TryFrom<&[u8]> for MetadataBlock {
         // parse val_len
         let val_len = match VarInt64::try_from(&value[offset..]) {
             Ok(var_int) => var_int,
-            Err(e) => return Err(SstError::Parse(format!("could not parse val_len: {e}",))),
+            Err(e) => return Err(SstError::Parse(format!("could not parse val_len: {e}"))),
         };
         offset += val_len.len();
 
@@ -354,13 +350,13 @@ impl TryFrom<&[u8]> for MetadataBlock {
         while offset < last {
             let len = match VarInt64::try_from(&value[offset..]) {
                 Ok(var_int) => var_int,
-                Err(e) => return Err(SstError::Parse(format!("could not parse len: {e}",))),
+                Err(e) => return Err(SstError::Parse(format!("could not parse len: {e}"))),
             };
             offset += len.len();
 
             let off = match VarInt64::try_from(&value[offset..]) {
                 Ok(var_int) => var_int,
-                Err(e) => return Err(SstError::Parse(format!("could not parse offset: {e}",))),
+                Err(e) => return Err(SstError::Parse(format!("could not parse offset: {e}"))),
             };
             offset += off.len();
             let key: Vec<u8> = value[offset..(offset + len.value() as usize - off.len())].to_vec();
@@ -371,7 +367,7 @@ impl TryFrom<&[u8]> for MetadataBlock {
         // parse start_len
         let start_len = match VarInt64::try_from(&value[offset..]) {
             Ok(var_int) => var_int,
-            Err(e) => return Err(SstError::Parse(format!("could not parse start_len: {e}",))),
+            Err(e) => return Err(SstError::Parse(format!("could not parse start_len: {e}"))),
         };
         offset += start_len.len();
 
@@ -382,7 +378,7 @@ impl TryFrom<&[u8]> for MetadataBlock {
         // parse end_len
         let end_len = match VarInt64::try_from(&value[offset..]) {
             Ok(var_int) => var_int,
-            Err(e) => return Err(SstError::Parse(format!("could not parse end_len: {e}",))),
+            Err(e) => return Err(SstError::Parse(format!("could not parse end_len: {e}"))),
         };
         offset += end_len.len();
 
@@ -395,7 +391,7 @@ impl TryFrom<&[u8]> for MetadataBlock {
             Ok(var_int) => var_int,
             Err(e) => {
                 return Err(SstError::Parse(format!(
-                    "could not parse metadata_len: {e}",
+                    "could not parse metadata_len: {e}"
                 )))
             }
         };
@@ -405,7 +401,7 @@ impl TryFrom<&[u8]> for MetadataBlock {
         let metadata_buf = &value[offset..(offset + metadata_len.value() as usize)];
         let metadata = match SstMetadata::try_from(metadata_buf) {
             Ok(md) => md,
-            Err(e) => return Err(SstError::Parse(format!("could not parse metadata: {e:?}",))),
+            Err(e) => return Err(SstError::Parse(format!("could not parse metadata: {e:?}"))),
         };
         Ok(MetadataBlock {
             bloom_filter,
