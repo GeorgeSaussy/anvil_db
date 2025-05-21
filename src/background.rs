@@ -52,7 +52,7 @@ impl BackgroundExecutor {
 
 impl Drop for BackgroundExecutor {
     fn drop(&mut self) {
-        self.wal_tx.send(Assignment::Unused).unwrap();
-        self.compactor_tx.send(Assignment::Unused).unwrap();
+        let _ = self.wal_tx.send(Assignment::Unused);
+        let _ = self.compactor_tx.send(Assignment::Unused);
     }
 }

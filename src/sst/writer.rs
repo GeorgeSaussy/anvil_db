@@ -1,6 +1,3 @@
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
-
 use crate::common::try_u64;
 use crate::common::try_usize;
 use crate::kv::TombstonePairLike;
@@ -8,12 +5,11 @@ use crate::sst::common::KeyRange;
 use crate::sst::common::SstError;
 use crate::sst::metadata::MetadataBlock;
 use crate::sst::metadata::SstMetadata;
+use crate::storage::blob_store::BlobId;
 use crate::storage::blob_store::BlobStore;
 use crate::storage::blob_store::BlobStoreError;
 use crate::storage::blob_store::WriteCursor;
 use crate::var_int::VarInt64;
-
-type BlobId = String;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SstWriteSettings {
@@ -119,9 +115,7 @@ impl BlockBuilder {
         self.bytes_written += buf.len();
         match writer.write(buf) {
             Ok(_) => Ok(buf.len()),
-            Err(err) => Err(SstError::Write(
-                format!("could not write to file: {err:?}",),
-            )),
+            Err(err) => Err(SstError::Write(format!("could not write to file: {err:?}"))),
         }
     }
 
@@ -150,12 +144,14 @@ impl BlockBuilder {
                 }
             }
         }
+        debug_assert!(my_common_len <= key_data.len());
+        debug_assert!(my_common_len <= prev_data.len());
         self.last_common_len = my_common_len;
         let common_len = match VarInt64::try_from(my_common_len) {
             Ok(common_len) => common_len,
             Err(err) => {
                 return Err(SstError::Parse(format!(
-                    "could not parse lengths {my_common_len}: {err:?}",
+                    "could not parse lengths {my_common_len}: {err:?}"
                 )))
             }
         };
@@ -168,7 +164,7 @@ impl BlockBuilder {
             Ok(diff_len) => diff_len,
             Err(err) => {
                 return Err(SstError::Parse(format!(
-                    "could not parse lengths {diff_len_value}: {err:?}",
+                    "could not parse lengths {diff_len_value}: {err:?}"
                 )))
             }
         };
@@ -201,9 +197,10 @@ impl BlockBuilder {
     }
 
     fn is_done(&self) -> bool {
-        self.bytes_written >= self.write_settings.target_keys_per_block
-            || self.bytes_written >= self.write_settings.target_block_size_bytes
-            || (self.last_common_len == 0 && self.key_count > 1)
+        let d = if self.last_common_len == 0 { 2 } else { 1 };
+        (self.bytes_written >= self.write_settings.target_keys_per_block / d
+            || self.bytes_written >= self.write_settings.target_block_size_bytes / d)
+            && self.key_count > 0
     }
 
     fn is_new(&self) -> bool {
@@ -259,6 +256,11 @@ impl<WC: WriteCursor> SstBuilder<WC> {
     }
 
     fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<(), SstError> {
+        debug_assert!(
+            !key.is_empty(),
+            "blob_id = {} ; key = {key:?} ; value = {value:?}",
+            self.blob_id
+        );
         if self.current_block.is_new() {
             let offset = try_u64(self.writer.bytes_written)?;
             self.metadata_block.index(offset, key);
@@ -299,13 +301,11 @@ impl<WC: WriteCursor> SstBuilder<WC> {
         let total = [buf, buf_len_bytes.to_vec()].concat();
         if let Err(err) = self.writer.write(&total) {
             return Err(SstError::Write(format!(
-                "could not write metadata block: {err:?}",
+                "could not write metadata block: {err:?}"
             )));
         }
         if let Err(err) = self.writer.flush() {
-            return Err(SstError::Write(
-                format!("could not finalize file: {err:?}",),
-            ));
+            return Err(SstError::Write(format!("could not finalize file: {err:?}")));
         }
         Ok(())
     }
@@ -327,7 +327,7 @@ pub struct NameGenerator {
 
 impl NameGenerator {
     pub fn new(compactor_idx: usize) -> NameGenerator {
-        let epoch = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        let epoch = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(d) => d.as_nanos(),
             Err(_) => 1337,
         };
@@ -373,11 +373,11 @@ impl SstWriter {
             let base_name = gen.base_name();
 
             blob_id = if is_minor_sst {
-                format!("{base_name}.minor.sst",)
+                format!("{base_name}.minor.sst")
             } else if !includes_tombstones {
-                format!("{base_name}.base.sst",)
+                format!("{base_name}.base.sst")
             } else {
-                format!("{base_name}.sst",)
+                format!("{base_name}.sst")
             };
 
             match blob_store.create_blob(&blob_id) {
@@ -417,13 +417,13 @@ impl SstWriter {
             self.new_sst_builder(blob_store, is_minor_sst, includes_tombstones, gen)?;
         let mut blob_ids = vec![sst_builder.blob_id.clone()];
         for result in pairs {
+            let pair = result?;
             if !is_minor_sst && sst_builder.is_done() {
                 sst_builder.close()?;
                 sst_builder =
                     self.new_sst_builder(blob_store, is_minor_sst, includes_tombstones, gen)?;
                 blob_ids.push(sst_builder.blob_id.clone());
             }
-            let pair = result?;
             n_pairs += 1;
             let key_ref = pair.key_ref();
             if let Some(value_ref) = pair.value_ref().as_ref() {

@@ -1,4 +1,4 @@
 {
   "rust-analyzer.linkedProjects": ["./Cargo.toml"],
-  "cSpell.words": ["cptr", "downto", "overlocked", "ssts"]
+  "cSpell.words": ["cptr", "dlist", "downto", "Nexts", "overlocked", "ssts"]
 }

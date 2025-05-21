@@ -73,7 +73,7 @@ impl VarInt64 {
         loop {
             let mut buf = [0_u8];
             if let Err(err) = reader.read_exact(&mut buf) {
-                return Err(format!("{err:?}",));
+                return Err(format!("{err:?}"));
             }
             let byte = buf[0];
             my_bytes.push(byte);
@@ -121,7 +121,7 @@ impl TryFrom<usize> for VarInt64 {
     fn try_from(value: usize) -> Result<Self, Self::Error> {
         let value = match u64::try_from(value) {
             Ok(x) => x,
-            Err(err) => return Err(format!("could not convert usize {value} to u64: {err}",))?,
+            Err(err) => return Err(format!("could not convert usize {value} to u64: {err}"))?,
         };
         VarInt64::try_from(value)
     }

@@ -1,8 +1,10 @@
 #[cfg(test)]
 mod test {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
     use crate::anvil_db::{AnvilDb, AnvilDbConfig};
     use crate::context::SimpleContext;
-    use crate::helpful_macros::unwrap;
     use crate::logging::{debug, DefaultLogger};
     use crate::sst::block_cache::cache::LruBlockCache;
     use crate::storage::blob_store::InMemoryBlobStore;
@@ -25,7 +27,7 @@ mod test {
         let mut values = Vec::new();
         for k in 0..top {
             let key: VarInt64 = VarInt64::try_from(k).unwrap();
-            keys.push(key);
+            keys.push(key.data_ref().to_vec());
             let value = VarInt64::try_from(k * k).unwrap();
             values.push(value);
         }
@@ -38,13 +40,13 @@ mod test {
             }
             let key = &keys[k];
             let val = &values[k];
-            assert!(jdb.get(key.data_ref()).unwrap().is_none());
-            assert!(jdb.set(key.data_ref(), val.data_ref()).is_ok());
-            assert!(jdb.set(key.data_ref(), &dummy).is_ok());
-            let found = jdb.get(key.data_ref()).unwrap().unwrap();
+            assert!(jdb.get(key).unwrap().is_none());
+            assert!(jdb.set(key, val.data_ref()).is_ok());
+            assert!(jdb.set(key, &dummy).is_ok());
+            let found = jdb.get(key).unwrap().unwrap();
             assert_eq!(found, dummy);
-            assert!(jdb.set(key.data_ref(), val.data_ref()).is_ok());
-            let getter = jdb.get(key.data_ref()).unwrap().unwrap();
+            assert!(jdb.set(key, val.data_ref()).is_ok());
+            let getter = jdb.get(key).unwrap().unwrap();
             assert_eq!(getter, val.data_ref());
         }
 
@@ -56,26 +58,25 @@ mod test {
         for k in 0..top {
             let key = &keys[k];
             if k % 2 != 0 {
-                assert!(jdb.get(key.data_ref()).unwrap().is_none());
+                assert!(jdb.get(key).unwrap().is_none());
                 continue;
             }
             let val = &values[k];
-            let found = jdb.get(key.data_ref()).unwrap().unwrap();
-            assert_eq!(found, val.data_ref().to_vec(), "k: {k}",);
+            let found = jdb.get(key).unwrap().unwrap();
+            assert_eq!(found, val.data_ref().to_vec(), "k: {k}");
         }
 
         assert!(jdb.close().is_ok());
     }
 
-    #[test]
-    fn test_anvil_db_monday() {
+    fn test_anvil_db_monday_inner() -> Result<(), String> {
         // TODO(t/1388): This number should be bigger.
         let top: usize = 500_usize;
 
         debug!(&(), "OPEN A NEW DB");
         let store = InMemoryBlobStore::new();
 
-        let jdb: TestOnlyAnvilDb = AnvilDb::new(store.clone()).unwrap();
+        let jdb: TestOnlyAnvilDb = AnvilDb::new(store.clone())?;
 
         debug!(&(), "CREATE SOME DATA");
         let mut keys = Vec::new();
@@ -83,15 +84,13 @@ mod test {
         let mut values_2 = Vec::new();
         let mut values_3 = Vec::new();
         for k in 0..top {
-            let key: VarInt64 = VarInt64::try_from(k).unwrap();
-            keys.push(key);
-            let value = VarInt64::try_from(k * k).unwrap();
+            let key: VarInt64 = VarInt64::try_from(k)?;
+            keys.push(key.data_ref().to_vec());
+            let value = VarInt64::try_from(k * k)?;
             values_1.push(value);
-            let value = VarInt64::try_from(k + 1).unwrap();
+            let value = VarInt64::try_from(k + 1)?;
             values_2.push(value);
-            let result = VarInt64::try_from(2 * k);
-            assert!(result.is_ok(), "Could not convert {} to VarInt64.", 2 * k);
-            let value = result.ok().unwrap();
+            let value = VarInt64::try_from(2 * k)?;
             values_3.push(value);
         }
         let dummy = vec![0, 0, 0];
@@ -104,28 +103,45 @@ mod test {
             let key = &keys[k];
             let val = &values_1[k];
             // TODO(t/1382): Uncomment this line.
-            // assert!(!jdb.update(key.data_ref(), val.data_ref()).is_ok());
-            assert!(jdb.get(key.data_ref()).unwrap().is_none());
-            assert!(jdb.set(key.data_ref(), val.data_ref()).is_ok());
-            assert!(jdb.set(key.data_ref(), &dummy).is_ok());
+            // assert!(!jdb.update(key, val.data_ref()).is_ok());
+            if jdb.get(key)?.is_some() {
+                return Err("get() returned Some".to_string());
+            }
+            jdb.set(key, val.data_ref())?;
+            jdb.set(key, &dummy)?;
             // TODO(t/1382): Replace the previous set operation with the following
             // commented out line:
-            // assert!(jdb.update(key.data_ref(), &dummy).is_ok());
-            let found = jdb.get(key.data_ref()).unwrap().unwrap();
-            assert_eq!(found, dummy);
-            assert!(jdb.set(key.data_ref(), val.data_ref()).is_ok());
+            // assert!(jdb.update(key, &dummy).is_ok());
+            let found_1 = jdb.get(key)?;
+            let found = if let Some(f) = found_1 {
+                f
+            } else {
+                return Err("get() returned None via found".to_string());
+            };
+            if found != dummy {
+                return Err("get() returned wrong value".to_string());
+            }
+            jdb.set(key, val.data_ref())?;
             // TODO(t/1382): Replace the previous set operation with the following
             // commented out line:
-            // assert!(jdb.update(key.data_ref(), val.data_ref()).is_ok());
-            let getter = jdb.get(key.data_ref()).unwrap().unwrap();
-            assert_eq!(getter, val.data_ref());
+            // assert!(jdb.update(key, val.data_ref()).is_ok());
+            let getter_1 = jdb.get(key)?;
+            let getter = if let Some(g) = getter_1 {
+                g
+            } else {
+                return Err("get() returned None via getter".to_string());
+            };
+            if getter != val.data_ref() {
+                return Err("get() returned wrong value".to_string());
+            }
         }
 
-        assert!(jdb.close().is_ok());
+        jdb.close()?;
 
         debug!(&(), "CHECK VALUES SURVIVED RECOVERY");
         let jdb: TestOnlyAnvilDb =
             AnvilDb::recover(store.clone(), AnvilDbConfig::default()).unwrap();
+        debug!(&(), "DATABASE LOADED AFTER RECOVERY");
 
         for k in 0..top {
             if k % 2 != 0 {
@@ -133,7 +149,7 @@ mod test {
             }
             let key = &keys[k];
             let val = &values_1[k];
-            let found = unwrap!(unwrap!(jdb.get(key.data_ref())));
+            let found = jdb.get(key).unwrap().unwrap();
             assert_eq!(found, val.data_ref().to_vec(), "k: {k}",);
         }
 
@@ -144,9 +160,9 @@ mod test {
             }
             let key = &keys[k];
             let val = &values_2[k];
-            assert!(jdb.get(key.data_ref()).unwrap().is_none());
-            assert!(jdb.set(key.data_ref(), val.data_ref()).is_ok());
-            assert_eq!(jdb.get(key.data_ref()).unwrap().unwrap(), val.data_ref());
+            assert!(jdb.get(key).unwrap().is_none());
+            assert!(jdb.set(key, val.data_ref()).is_ok());
+            assert_eq!(jdb.get(key).unwrap().unwrap(), val.data_ref());
         }
 
         assert!(jdb.close().is_ok());
@@ -155,6 +171,8 @@ mod test {
         let jdb: TestOnlyAnvilDb =
             AnvilDb::recover(store.clone(), AnvilDbConfig::default()).unwrap();
 
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
         for k in 0..top {
             let key = &keys[k];
             let val = if k % 2 == 0 {
@@ -162,7 +180,7 @@ mod test {
             } else {
                 &values_2[k]
             };
-            assert_eq!(jdb.get(key.data_ref()).unwrap().unwrap(), val.data_ref());
+            assert_eq!(jdb.get(key).unwrap().unwrap(), val.data_ref());
         }
 
         debug!(&(), "CHECK OVERRIDING SOME VALUES");
@@ -174,12 +192,12 @@ mod test {
             } else {
                 &values_2[k]
             };
-            assert_eq!(jdb.get(key.data_ref()).unwrap().unwrap(), val.data_ref());
+            assert_eq!(jdb.get(key).unwrap().unwrap(), val.data_ref());
 
             // override the value
             let val = &values_3[k];
-            assert!(jdb.set(key.data_ref(), val.data_ref()).is_ok());
-            assert_eq!(jdb.get(key.data_ref()).unwrap().unwrap(), val.data_ref());
+            assert!(jdb.set(key, val.data_ref()).is_ok());
+            assert_eq!(jdb.get(key).unwrap().unwrap(), val.data_ref());
         }
 
         debug!(&(), "CLOSE AND RECOVER");
@@ -191,24 +209,21 @@ mod test {
         for k in 0..top {
             let key = &keys[k];
 
-            assert!(jdb.get(key.data_ref()).unwrap().is_some());
+            assert!(jdb.get(key).unwrap().is_some());
             // TODO(t/1383): Uncomment the following line.
             // assert!(jdb.insert(key.data_ref(), values_2[k].data_ref()).is_err());
 
-            assert!(jdb.remove(key.data_ref()).is_ok());
-            assert!(jdb.get(key.data_ref()).unwrap().is_none());
+            assert!(jdb.remove(key).is_ok());
+            assert!(jdb.get(key).unwrap().is_none());
 
-            assert!(jdb.set(key.data_ref(), values_2[k].data_ref()).is_ok());
+            assert!(jdb.set(key, values_2[k].data_ref()).is_ok());
             // TODO(t/1382): Replace the previous set operation with the following
             // commented out line:
             // assert!(jdb.insert(key.data_ref(), values_2[k].data_ref()).is_ok());
 
-            assert_eq!(
-                jdb.get(key.data_ref()).unwrap().unwrap(),
-                values_2[k].data_ref()
-            );
-            assert!(jdb.remove(key.data_ref()).is_ok());
-            assert!(jdb.get(key.data_ref()).unwrap().is_none());
+            assert_eq!(jdb.get(key).unwrap().unwrap(), values_2[k].data_ref());
+            assert!(jdb.remove(key).is_ok());
+            assert!(jdb.get(key).unwrap().is_none());
         }
 
         debug!(&(), "CLOSE, RECOVER, CHECK EMPTY");
@@ -217,10 +232,53 @@ mod test {
             AnvilDb::recover(store.clone(), AnvilDbConfig::default()).unwrap();
 
         for key in keys.iter().take(top) {
-            assert!(jdb.get(key.data_ref()).unwrap().is_none());
+            assert!(jdb.get(key).unwrap().is_none());
         }
 
         debug!(&(), "CLEAN UP");
-        assert!(jdb.close().is_ok());
+        jdb.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_anvil_db_monday_1() {
+        let result = test_anvil_db_monday_inner();
+        assert!(
+            result.is_ok(),
+            "test_anvil_db_monday_inner failed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_anvil_db_monday_2() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let order = std::sync::atomic::Ordering::SeqCst;
+        let n_threads = 16;
+        let start_signal = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::with_capacity(n_threads);
+        for _ in 0..n_threads {
+            let start_signal = start_signal.clone();
+            let tx = tx.clone();
+            let handle = std::thread::spawn(move || {
+                while !start_signal.load(order) {
+                    std::thread::yield_now();
+                }
+                tx.send(test_anvil_db_monday_inner()).unwrap();
+            });
+            handles.push(handle);
+        }
+        start_signal.store(true, order);
+        let mut err_count = 0;
+        for handle in handles.into_iter() {
+            if let Err(_err) = handle.join() {
+                err_count += 1;
+            }
+        }
+        for _ in 0..n_threads {
+            if let Ok(Err(err)) = rx.recv() {
+                panic!("Thread failure: {err:?}");
+            }
+        }
+        assert_eq!(err_count, 0, "Some threads panicked");
     }
 }

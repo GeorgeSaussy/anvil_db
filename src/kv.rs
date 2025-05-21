@@ -21,7 +21,7 @@ pub(crate) enum TombstoneValue {
 }
 
 impl TombstoneValue {
-    pub(crate) fn as_ref(&self) -> Option<&Vec<u8>> {
+    pub(crate) fn vec_ref(&self) -> Option<&Vec<u8>> {
         match self {
             TombstoneValue::Tombstone => None,
             TombstoneValue::Value(v) => Some(v),
@@ -128,7 +128,7 @@ impl From<(Vec<u8>, TombstoneValue)> for TombstonePair {
 
 pub(crate) trait TombstonePairLike {
     fn key_ref(&self) -> &[u8];
-    fn value_ref(&self) -> &TombstoneValue;
+    fn value_ref(&self) -> Option<&[u8]>;
 }
 
 impl TombstonePairLike for TombstonePair {
@@ -136,8 +136,8 @@ impl TombstonePairLike for TombstonePair {
         self.key_ref()
     }
 
-    fn value_ref(&self) -> &TombstoneValue {
-        self.value_ref()
+    fn value_ref(&self) -> Option<&[u8]> {
+        self.value_ref().as_ref()
     }
 }
 
@@ -519,8 +519,10 @@ where
 #[cfg(test)]
 mod test {
 
+    use std::sync::Arc;
+
     use super::*;
-    use crate::concurrent_skip_list::{ConcurrentSkipList, ConcurrentSkipListScanner};
+    use crate::structs::skip_list::{SkipList, SkipListScanner};
 
     fn some_key() -> Vec<u8> {
         vec![0, 2, 3]
@@ -541,7 +543,7 @@ mod test {
         let pair = some_pair();
         assert_eq!(cmp_key(pair.key_ref(), &some_key()), Ordering::Equal);
         assert_eq!(
-            cmp_key(pair.value_ref().as_ref().unwrap(), &some_val()),
+            cmp_key(pair.value_ref().vec_ref().unwrap(), &some_val()),
             Ordering::Equal
         );
     }
@@ -550,7 +552,7 @@ mod test {
     fn test_pair_deletion_marker() {
         let pair = TombstonePair::deletion_marker(some_key());
         assert_eq!(cmp_key(pair.key_ref(), &some_key()), Ordering::Equal);
-        assert_eq!(pair.value_ref().as_ref(), None);
+        assert_eq!(pair.value_ref().vec_ref(), None);
     }
 
     #[test]
@@ -563,13 +565,13 @@ mod test {
     fn test_pair_value() {
         let pair = some_pair();
         assert_eq!(
-            cmp_key(pair.value_ref().as_ref().unwrap(), &some_val()),
+            cmp_key(pair.value_ref().vec_ref().unwrap(), &some_val()),
             Ordering::Equal
         );
     }
 
     struct SkipListPairIter {
-        inner: ConcurrentSkipListScanner<Vec<u8>, Option<Vec<u8>>>,
+        inner: SkipListScanner,
     }
 
     impl Iterator for SkipListPairIter {
@@ -579,7 +581,7 @@ mod test {
             let view = self.inner.next()?;
             let key = view.key_ref().to_vec();
             if let Some(value) = view.value_ref().as_ref() {
-                return Some(Ok(TombstonePair::new(key, value.clone())));
+                return Some(Ok(TombstonePair::new(key, value.to_vec())));
             }
             Some(Ok(TombstonePair::deletion_marker(key)))
         }
@@ -605,23 +607,21 @@ mod test {
         let top = 5 * 10_000_usize;
 
         // create the skip lists
-        let mut skip_list_a: ConcurrentSkipList<Vec<u8>, Option<Vec<u8>>> =
-            ConcurrentSkipList::new();
-        let mut skip_list_b: ConcurrentSkipList<Vec<u8>, Option<Vec<u8>>> =
-            ConcurrentSkipList::new();
+        let skip_list_a = Arc::new(SkipList::default());
+        let skip_list_b = Arc::new(SkipList::default());
 
         // set initial values
-        let val = Some(vec![1]);
+        let val = vec![1];
         for i in 0..(4 * top) {
             let idx = i as u64;
             let key = idx.to_be_bytes();
-            skip_list_a.set(key, val.clone());
-            skip_list_b.set(key, val.clone());
+            skip_list_a.insert(&key, Some(&val));
+            skip_list_b.insert(&key, Some(&val));
         }
 
         // construct joined iterator
-        let scanner_a = skip_list_a.iter();
-        let scanner_b = skip_list_b.iter();
+        let scanner_a = <SkipListScanner as From<_>>::from(skip_list_a.clone());
+        let scanner_b = <SkipListScanner as From<_>>::from(skip_list_b.clone());
         let mut joined_iter: JoinedIter<(), SkipListPairIter, SkipListPairIter> = JoinedIter::new(
             SkipListPairIter { inner: scanner_a },
             SkipListPairIter { inner: scanner_b },
@@ -629,30 +629,22 @@ mod test {
 
         // interleave writing writers and scanning
         let mini = top / 5 - 1;
-        let do_nothing = 0;
-        let to_remove = 1;
-        let to_set = 2;
         for i in 0..mini {
             let idx = (i * 5) as u64;
 
-            let a_action = i % 3;
-            let b_action = (i / 3) % 3;
-            let programs = [(&mut skip_list_a, a_action), (&mut skip_list_b, b_action)];
+            let a_skips = i % 3 == 0;
+            let b_skips = (i / 3) % 3 == 0;
+            let programs = [(&skip_list_a, a_skips), (&skip_list_b, b_skips)];
 
             // set i to 2, i+1 to 0, i+2 to 3, leave i+3 as 1, and delete / reset i+4
-            for (skip_list_ref, action) in programs {
-                skip_list_ref.set(idx.to_be_bytes(), vec![2]);
-                skip_list_ref.set((idx + 1).to_be_bytes(), vec![0]);
-                skip_list_ref.set((idx + 2).to_be_bytes(), vec![3]);
-                if action == to_remove {
-                    skip_list_ref.remove(&(idx + 4).to_be_bytes().to_vec());
+            for (skip_list_ref, to_skip) in programs {
+                skip_list_ref.insert(&idx.to_be_bytes(), Some(&[2]));
+                skip_list_ref.insert(&(idx + 1).to_be_bytes(), Some(&[0]));
+                skip_list_ref.insert(&(idx + 2).to_be_bytes(), Some(&[3]));
+                if to_skip {
                     continue;
                 }
-                if action == to_set {
-                    skip_list_ref.set((idx + 4).to_be_bytes(), None);
-                    continue;
-                }
-                assert_eq!(action, do_nothing);
+                skip_list_ref.insert(&(idx + 4).to_be_bytes(), None);
             }
 
             // scan over the new values
@@ -666,38 +658,25 @@ mod test {
                 // so that it can be changed later.
                 let view = joined_iter.next().unwrap().unwrap();
                 assert_eq!(view.key_ref().to_vec(), idx.to_be_bytes());
-                let value = view.value_ref().as_ref().unwrap().to_vec();
+                let value = view.value_ref().vec_ref().unwrap().to_vec();
                 assert_eq!(value.len(), 1);
                 assert!(value[0] == 1 || value[0] == 2);
             }
             let view = joined_iter.next().unwrap().unwrap();
             assert_eq!(view.key_ref().to_vec(), (idx + 1).to_be_bytes());
-            assert_eq!(view.value_ref().as_ref().unwrap().to_vec(), vec![0]);
+            assert_eq!(view.value_ref().vec_ref().unwrap().to_vec(), vec![0]);
             let view = joined_iter.next().unwrap().unwrap();
             assert_eq!(view.key_ref().to_vec(), (idx + 2).to_be_bytes());
-            assert_eq!(view.value_ref().as_ref().unwrap().to_vec(), vec![3]);
+            assert_eq!(view.value_ref().vec_ref().unwrap().to_vec(), vec![3]);
             let view = joined_iter.next().unwrap().unwrap();
             assert_eq!(view.key_ref().to_vec(), (idx + 3).to_be_bytes());
             assert_eq!(view.value_ref().as_ref().unwrap().to_vec(), vec![1]);
-            if a_action != to_remove || b_action != to_remove {
-                let expected = if a_action == do_nothing {
-                    Some(vec![1])
-                } else if a_action == to_set {
-                    None
-                } else if b_action == do_nothing {
-                    assert_eq!(a_action, to_remove);
-                    Some(vec![1])
-                } else {
-                    assert_eq!(a_action, to_remove);
-                    assert_eq!(b_action, to_set);
-                    None
-                };
+            let expected = if a_skips { Some(vec![1]) } else { None };
 
-                let pair = joined_iter.next().unwrap().unwrap();
-                let found = pair.value_ref().as_ref().cloned();
-                assert_eq!(pair.key_ref().to_vec(), (idx + 4).to_be_bytes());
-                assert_eq!(found, expected);
-            }
+            let pair = joined_iter.next().unwrap().unwrap();
+            let found = pair.value_ref().as_ref().map(|x| x.to_vec());
+            assert_eq!(pair.key_ref().to_vec(), (idx + 4).to_be_bytes());
+            assert_eq!(found, expected);
         }
     }
 }

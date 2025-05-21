@@ -1,11 +1,13 @@
-use std::collections::HashSet;
 use std::fmt::Debug;
+use std::sync::Arc;
 
+use super::wal_entry::WalRecoveryError;
 use super::wal_writer::INIT_WAL_CHECKSUM;
 use crate::checksum::crc32;
-use crate::concurrent_skip_list::ConcurrentSkipList;
-use crate::kv::{TombstonePair, TombstoneValueLike};
-use crate::storage::blob_store::{BlobStore, ReadCursor, WriteCursor};
+use crate::kv::{TombstonePair, TombstonePairLike, TombstoneValue, TombstoneValueLike};
+use crate::manifest::{Manifest, ManifestUpdate, ManifestUpdateType};
+use crate::storage::blob_store::{BlobId, BlobStore, ReadCursor, WriteCursor};
+use crate::structs::skip_list::{SkipList, SkipListScanner};
 use crate::wal::wal_entry::{WalEntry, WalEntryBlock, WalError};
 use crate::wal::wal_writer::WalWriter;
 
@@ -105,36 +107,26 @@ impl WalWrapperConfig {
     }
 }
 
-pub(crate) struct RecoveryData {
+#[derive(Default)]
+pub(crate) struct WalRecoveryData {
     /// tuples of the blob_id for the un-compacted WAL and the updates in that
     /// WAL, listed from oldest to newest
-    un_compacted_updates: Vec<(String, Vec<TombstonePair>)>,
-    /// levels of the SST store containing the blob_ids in order by level
-    /// from oldest to newest
-    manifest: Vec<String>,
+    un_compacted_updates: Vec<(BlobId, Vec<TombstonePair>)>,
     /// next WAL id to use
-    next_wal_id: usize,
-    garbage_wal_blob_ids: HashSet<String>,
-    garbage_sst_blob_ids: HashSet<String>,
+    pub(crate) next_wal_idx: usize,
+    pub(crate) manifest: Manifest,
 }
 
-impl RecoveryData {
-    pub(crate) fn manifest_ref(&self) -> &[String] {
-        &self.manifest
-    }
-
+impl WalRecoveryData {
     pub(crate) fn un_compacted_updates_ref(&self) -> &[(String, Vec<TombstonePair>)] {
         &self.un_compacted_updates
     }
 
-    pub(crate) fn next_wal_id(&self) -> usize {
-        self.next_wal_id
-    }
-
     pub(crate) fn garbage_blob_ids(&self) -> impl Iterator<Item = &'_ String> {
-        self.garbage_wal_blob_ids
+        self.manifest
+            .garbage_wal_ids
             .iter()
-            .chain(self.garbage_sst_blob_ids.iter())
+            .chain(self.manifest.garbage_sst_ids.iter())
     }
 }
 
@@ -145,22 +137,12 @@ pub(crate) struct WalWrapper<WC> {
     config: WalWrapperConfig,
 }
 
-struct BlobRecoveryData {
-    recovered_values: Vec<TombstonePair>,
-    sst_blob_ids: Option<Vec<String>>,
-    garbage_wal_blob_ids: HashSet<String>,
-    garbage_sst_blob_ids: HashSet<String>,
-}
-
 impl<WC: WriteCursor> WalWrapper<WC> {
     pub(crate) fn new<B: BlobStore<WriteCursor = WC>>(
         blob_store_ref: &B,
         wal_idx: usize,
         config: WalWrapperConfig,
-    ) -> Result<WalWrapper<WC>, WalError>
-    where
-        B::WriteCursor: Send + Sync + 'static,
-    {
+    ) -> Result<WalWrapper<WC>, WalError> {
         let blob_id = format!("wal.{wal_idx}.log");
         let mut blob_writer = match blob_store_ref.create_blob(&blob_id) {
             Ok(blob_writer) => blob_writer,
@@ -190,10 +172,7 @@ impl<WC: WriteCursor> WalWrapper<WC> {
     pub(crate) fn recover<B: BlobStore<WriteCursor = WC>>(
         blob_store: B,
         config: WalWrapperConfig,
-    ) -> Result<(WalWrapper<WC>, RecoveryData), WalError>
-    where
-        B::WriteCursor: Send + Sync + 'static,
-    {
+    ) -> Result<(WalWrapper<WC>, WalRecoveryData), WalError> {
         // list blobs for log files
         let blob_iter = match blob_store.blob_iter() {
             Ok(blob_iter) => blob_iter,
@@ -220,170 +199,101 @@ impl<WC: WriteCursor> WalWrapper<WC> {
                 true
             })
             .collect();
-        fn name_to_int(s: &str) -> usize {
-            let s2 = &s[4..s.len() - 4];
-            s2.parse::<usize>().unwrap()
-        }
+
         wal_blob_names.sort_by(|a, b| {
-            let a = name_to_int(a);
-            let b = name_to_int(b);
+            let a = Self::name_to_int(a);
+            let b = Self::name_to_int(b);
             a.cmp(&b)
         });
-        let mut un_compacted_updates = Vec::with_capacity(wal_blob_names.len());
-        let mut my_wal_idx = 0;
-        let mut garbage_wal_blob_ids = HashSet::new();
-        let mut garbage_sst_blob_ids = HashSet::new();
 
-        let mut sst_blob_ids: Option<Vec<String>> = None;
+        let mut recovery_data = WalRecoveryData::default();
         for blob_id in &wal_blob_names {
-            let wal_id = name_to_int(blob_id);
-            if wal_id >= my_wal_idx {
-                my_wal_idx = wal_id + 1;
-            }
-            let updates = WalWrapper::recover_from_blob(&blob_store, blob_id, sst_blob_ids)?;
-            un_compacted_updates.push((blob_id.clone(), updates.recovered_values));
-            un_compacted_updates
-                .retain(|(my_blob_id, _)| !updates.garbage_wal_blob_ids.contains(my_blob_id));
-            sst_blob_ids = updates.sst_blob_ids;
-            garbage_wal_blob_ids.extend(updates.garbage_wal_blob_ids);
-            garbage_sst_blob_ids.extend(updates.garbage_sst_blob_ids);
+            WalWrapper::recover_from_wal_id(&blob_store, blob_id, &mut recovery_data)?;
         }
-        let recovery_data = RecoveryData {
-            manifest: sst_blob_ids.unwrap_or_default(),
-            un_compacted_updates,
-            garbage_wal_blob_ids,
-            garbage_sst_blob_ids,
-            next_wal_id: my_wal_idx + 1,
-        };
-        let wrapper = WalWrapper::new(&blob_store, my_wal_idx, config)?;
+        let wrapper = WalWrapper::new(&blob_store, recovery_data.next_wal_idx, config)?;
         Ok((wrapper, recovery_data))
     }
 
-    fn recover_from_blob<B: BlobStore<WriteCursor = WC>>(
+    fn name_to_int(s: &str) -> usize {
+        let s2 = &s[4..s.len() - 4];
+        s2.parse::<usize>().unwrap()
+    }
+
+    fn recover_from_wal_id<B: BlobStore<WriteCursor = WC>>(
         blob_store: &B,
-        blob_name: &str,
-        start_sst_blob_ids: Option<Vec<String>>,
-    ) -> Result<BlobRecoveryData, WalError> {
-        let mut reader = blob_store.read_cursor(blob_name)?;
-        let mut sst_blob_ids = start_sst_blob_ids;
-        let mut garbage_wal_blob_ids = HashSet::new();
-        let mut garbage_sst_blob_ids = HashSet::new();
-        let skip_list: ConcurrentSkipList<Vec<u8>, TombstonePair> = ConcurrentSkipList::new();
+        blob_id: &str,
+        dst: &mut WalRecoveryData,
+    ) -> Result<(), WalError> {
+        let wal_idx = Self::name_to_int(blob_id);
+        dst.next_wal_idx = std::cmp::max(dst.next_wal_idx, wal_idx + 1);
+        let mut reader = blob_store.read_cursor(blob_id)?;
+        Self::recover_from_reader(&mut reader, blob_id, dst)?;
+        Ok(())
+    }
+
+    fn recover_from_reader<R: ReadCursor>(
+        reader: &mut R,
+        blob_id: &str,
+        dst: &mut WalRecoveryData,
+    ) -> Result<(), WalRecoveryError> {
+        let skip_list = SkipList::default();
         let expected_header = [0x47, 0x53, 0, 0];
         let mut checksum = crc32(INIT_WAL_CHECKSUM, &expected_header);
 
-        fn replace_compacted_sst_blob_ids(
-            current_blob_ids: Option<Vec<String>>,
-            old_blob_ids: &[String],
-            new_blob_id: String,
-            compaction_type: &str,
-        ) -> Result<Option<Vec<String>>, WalError> {
-            let current_blob_ids = current_blob_ids.ok_or_else(|| {
-                WalError::RecoveryError(format!(
-                    "{compaction_type} compaction entry found before snapshot could be constructed",
-                ))
-            })?;
-            let mut new_blob_ids =
-                Vec::with_capacity(current_blob_ids.len() + 1 - old_blob_ids.len());
-            let mut pushed_new_sst = false;
-            for blob_id in current_blob_ids.iter() {
-                if !old_blob_ids.contains(blob_id) {
-                    new_blob_ids.push(blob_id.clone());
-                    continue;
-                }
-                if pushed_new_sst {
-                    continue;
-                }
-                new_blob_ids.push(new_blob_id.clone());
-                pushed_new_sst = true;
-            }
-            Ok(Some(new_blob_ids))
-        }
-
         let mut found_header = [0x00; 4];
-        reader.read_exact(&mut found_header)?;
+        reader
+            .read_exact(&mut found_header)
+            .map_err(|err| WalRecoveryError::ReadExactFailed {
+                blob_id: blob_id.to_string(),
+                err,
+            })?;
         if found_header != expected_header {
-            return Err(WalError::RecoveryError(format!(
-                "unexpected header in WAL blob {blob_name}: {found_header:?}",
-            )));
+            return Err(WalRecoveryError::IncorrectHeader {
+                blob_id: blob_id.to_string(),
+                found: found_header,
+                expected: expected_header,
+            });
         }
 
-        while let Ok((block, next_checksum)) = WalEntryBlock::recover(&mut reader, checksum) {
+        while let Ok((block, next_checksum)) = WalEntryBlock::recover(reader, blob_id, checksum) {
             for entry in block.entries_ref().iter() {
                 match entry {
                     WalEntry::Set { key, value } => {
-                        skip_list.set(key.to_vec(), TombstonePair::new(key.clone(), value.clone()));
+                        skip_list.insert(key, Some(value));
                     }
                     WalEntry::Remove { key } => {
-                        skip_list.set(key.to_vec(), TombstonePair::deletion_marker(key.clone()));
+                        skip_list.insert(key, None);
                     }
-                    WalEntry::MinorCompaction {
-                        wal_blob_id,
-                        sst_blob_id,
-                    } => {
-                        garbage_wal_blob_ids.insert(wal_blob_id.clone());
-                        if let Some(current_blob_ids) = sst_blob_ids.as_mut() {
-                            current_blob_ids.push(sst_blob_id.clone());
-                        } else {
-                            sst_blob_ids = Some(vec![sst_blob_id.clone()]);
+                    WalEntry::ManifestSnapshot(manifest) => {
+                        if dst.manifest != *manifest {
+                            return Err(WalRecoveryError::ManifestMismatch {
+                                blob_id: blob_id.to_string(),
+                                found: Box::new(manifest.clone()),
+                                expected: Box::new(dst.manifest.clone()),
+                            });
                         }
                     }
-                    WalEntry::MergeCompaction {
-                        start_sst_blob_ids,
-                        end_sst_blob_id,
-                    } => {
-                        sst_blob_ids = replace_compacted_sst_blob_ids(
-                            sst_blob_ids,
-                            start_sst_blob_ids,
-                            end_sst_blob_id.clone(),
-                            "minor",
-                        )?;
-                        garbage_wal_blob_ids.extend(start_sst_blob_ids.iter().cloned());
-                    }
-                    WalEntry::MajorCompaction {
-                        start_sst_blob_ids,
-                        end_sst_blob_id,
-                    } => {
-                        sst_blob_ids = replace_compacted_sst_blob_ids(
-                            sst_blob_ids,
-                            start_sst_blob_ids,
-                            end_sst_blob_id.clone(),
-                            "major",
-                        )?;
-                        garbage_sst_blob_ids.extend(start_sst_blob_ids.iter().cloned());
-                    }
-                    WalEntry::ManifestSnapshot {
-                        sst_blob_ids: my_blob_ids,
-                    } => {
-                        if let Some(current_blob_ids) = sst_blob_ids {
-                            if current_blob_ids != *my_blob_ids {
-                                return Err(WalError::RecoveryError(format!(
-                                    "sst blob ids in manifest snapshot do not match previous \
-                                     snapshot: {current_blob_ids:?} vs {my_blob_ids:?}",
-                                )));
-                            }
-                        }
-                        sst_blob_ids = Some(my_blob_ids.clone());
-                    }
+                    WalEntry::ManifestUpdate(update) => dst
+                        .manifest
+                        .apply(update)
+                        .map_err(WalRecoveryError::BadManifestUpdate)?,
                 }
             }
             checksum = next_checksum;
         }
 
-        let pairs = skip_list
-            .into_iter()
+        let scanner = SkipListScanner::from(Arc::new(skip_list));
+        let pairs = scanner
             .map(|view| {
+                let key = view.key_ref();
                 let value = view.value_ref();
-                value.clone()
+
+                TombstonePair::from((key.to_vec(), TombstoneValue::from(&value)))
             })
             .collect();
+        dst.un_compacted_updates.push((blob_id.to_string(), pairs));
 
-        Ok(BlobRecoveryData {
-            recovered_values: pairs,
-            sst_blob_ids,
-            garbage_wal_blob_ids,
-            garbage_sst_blob_ids,
-        })
+        Ok(())
     }
 
     fn write_entry(&mut self, entry: WalEntry) -> Result<bool, WalError> {
@@ -414,15 +324,24 @@ impl<WC: WriteCursor> WalWrapper<WC> {
         self.async_write_entry(WalEntry::from((key, value))).await
     }
 
-    pub(crate) fn mark_minor_compaction(
+    pub(crate) fn record_index_change(&mut self, update: &ManifestUpdate) -> Result<(), WalError> {
+        self.write_entry(WalEntry::ManifestUpdate(update.clone()))?;
+        Ok(())
+    }
+
+    pub(crate) fn recovery_mark_minor_compaction(
         &mut self,
         wal_blob_id: &str,
-        sst_blob_id: &str,
+        sst_blob_ids: &[String],
     ) -> Result<(), WalError> {
-        self.write_entry(WalEntry::MinorCompaction {
-            wal_blob_id: wal_blob_id.to_string(),
-            sst_blob_id: sst_blob_id.to_string(),
-        })?;
+        self.write_entry(WalEntry::ManifestUpdate(ManifestUpdate {
+            update_type: ManifestUpdateType::Minor,
+            garbage_collected_blob_ids: Vec::new(),
+            compacted_wal_ids: vec![wal_blob_id.to_string()],
+            compacted_minor_sst_ids: Vec::new(),
+            new_minor_sst_ids: vec![sst_blob_ids.to_vec()],
+            level_sst_updates: Vec::new(),
+        }))?;
         Ok(())
     }
 
@@ -502,7 +421,7 @@ mod test {
             let key = pair.key_ref();
             let value = pair.value_ref();
             let ki = VarInt64::try_from(key).unwrap().value();
-            let vi = VarInt64::try_from(value.as_ref().unwrap().as_ref())
+            let vi = VarInt64::try_from(value.vec_ref().unwrap().as_ref())
                 .unwrap()
                 .value();
             assert_eq!(ki % 2, 0);
@@ -539,7 +458,7 @@ mod test {
         for un_compacted_updates in &recovery_data.un_compacted_updates {
             for pair in &un_compacted_updates.1 {
                 let key: Vec<u8> = pair.key_ref().to_vec();
-                let value: Option<Vec<u8>> = pair.value_ref().as_ref().map(|v| v.to_vec());
+                let value: Option<Vec<u8>> = pair.value_ref().vec_ref().map(|v| v.to_vec());
                 update_map.insert(key, value);
             }
         }
